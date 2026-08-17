@@ -157,3 +157,14 @@ SGLANG_DSV4_FP4_DEQUANT=1 python -m sglang.launch_server \
   --port 8000
 ```
 （kv dtype、context 上限等在实现中校正；57k bug 若 sglang 不复现则放开 context-length）
+
+---
+
+## Part 3 — sglang 实施决策记录（2026-08-18，设计已批准）
+
+- 分支：`feat/deepseek-v4-sm80`（对齐 vLLM 侧分支名）
+- 目标：8×A100-80G，TP=8，bs=1，FP8 ckpt 载入，prefill ≥1000 tok/s，decode ≥50 tok/s
+- 阶段一（本分支主体）：eager 正确性打通 —— 移植 A（fp8 MQA logits triton）+ B（sparse MLA triton，sink + extra_k_cache，元素级 stride）+ sm80 dispatch 门控 + 数值验证（kernel 单测 + "capital of France → Paris" smoke）
+- 阶段二（条件触发）：仅当 eager decode <50 tok/s 时做 CUDA graph 优化；piecewise cudagraph 明确不做（vLLM 侧验证损坏）
+- 跳过：marlin-experts MoE（用 sglang 现成 `SGLANG_DSV4_FP4_DEQUANT=1` → triton MoE）；wo_a bf16 保护（sglang 已解决）
+- 启动基线：§2.7 命令，`--context-length 49152` 起，57k+ 交叉验证后放开
