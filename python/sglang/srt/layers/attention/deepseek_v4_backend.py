@@ -28,6 +28,9 @@ from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPContr
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.kernels.ops.attention.dsv4.triton_sparse_mla import (
+    triton_sparse_mla_fwd,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -1716,6 +1719,24 @@ class DeepseekV4AttnBackend(
             extra_indices = match_num_queries(extra_indices, value=-1)
             extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
 
+            # sm80: no flashmla — route decode AND prefill (all compress
+            # ratios) through the Triton sparse kernel on the pre-unsqueeze
+            # shapes ([T,H,512] q, 2D [T,W] indices), bypassing the
+            # flashmla/sparse-prefill branches below.
+            if _is_sm80:
+                assert attn_sink is not None
+                return self._forward_triton_sparse(
+                    q=q.squeeze(1) if q.ndim == 4 else q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    token_to_kv_pool=token_to_kv_pool,
+                    swa_indices=swa_page_indices,
+                    swa_lens=swa_topk_lengths,
+                    comp_indices=extra_indices,
+                    comp_lens=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                )
+
             if q.ndim == 3:
                 q = q.unsqueeze(1)
             if swa_page_indices.ndim == 2:
@@ -1798,6 +1819,53 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_triton_sparse(
+        self,
+        *,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 4, 128],
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        comp_indices: Optional[torch.Tensor],
+        comp_lens: Optional[torch.Tensor],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """sm80 sparse MLA over the packed u8 pools via the Triton kernel.
+
+        q is [T, H, 512] bf16; returns [T, H, head_dim_v]. Receives the
+        match_num_queries-normalized index tensors. The pool getters may
+        hand back a bf16-typed view of the u8 buffer — reinterpret to
+        uint8 (byte-identical) for the kernel. SWA-only for compress_ratio 0.
+        """
+        swa_buf = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+        if swa_buf.dtype != torch.uint8:
+            swa_buf = swa_buf.view(torch.uint8)
+        comp_buf = None
+        comp_page = None
+        if compress_ratio != 0:
+            comp_buf = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            comp_page = token_to_kv_pool.page_size // compress_ratio
+        if comp_buf is not None and comp_buf.dtype != torch.uint8:
+            comp_buf = comp_buf.view(torch.uint8)
+        out_cache = q.new_empty((q.shape[0], q.shape[1], self.head_dim_v))
+        triton_sparse_mla_fwd(
+            q,
+            out_cache,
+            swa_buf,
+            swa_indices,
+            swa_lens,
+            comp_buf,
+            comp_indices,
+            comp_lens,
+            self.softmax_scale,
+            attn_sink,
+            swa_page=token_to_kv_pool.swa_window_size,
+            comp_page=comp_page,
+        )
+        return out_cache
 
     def _forward_prefill_sparse(
         self,
