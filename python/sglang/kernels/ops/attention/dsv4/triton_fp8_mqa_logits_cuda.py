@@ -18,14 +18,50 @@ import triton.language as tl
 @triton.jit
 def _fp8e4m3_to_f32(x):
     # Decode e4m3fn bits: normal = (1 + m/8) * 2^(e-7), subnormal = m * 2^-9.
-    # ponytail: NaN (e=15, m=7) decodes to 480; quantized fp8 has no NaNs.
+    # e=15, m=7 is the only NaN encoding; decode it to NaN (torch parity, the
+    # dequant_k_cache self-check compares against torch on random bytes).
     u = x.to(tl.uint32)
     e = (u >> 3) & 15
     m = u & 7
     norm = (((e + 120) << 23) | (m << 20)).to(tl.float32, bitcast=True)
     sub = m.to(tl.float32) * 0.001953125
     s = tl.where((u & 0x80) != 0, -1.0, 1.0)
-    return tl.where(e == 0, sub, norm) * s
+    out = tl.where(e == 0, sub, norm) * s
+    return tl.where((e == 15) & (m == 7), float("nan"), out)
+
+
+@triton.jit
+def _f32_to_e4m3_bits(x):
+    # Software fp32 -> e4m3fn encode (RNE, satfinite to +/-448, NaN -> 0x7F):
+    # inverse of _fp8e4m3_to_f32 above (bias 7, 3 mantissa bits, subnormal
+    # step 2^-9). Triton rejects fp8e4nv pointers on sm_80, so OCP fp8 values
+    # are stored as bits via a uint8 view. Validated bit-exact vs torch.
+    ux = x.to(tl.uint32, bitcast=True)
+    sign = (ux >> 24).to(tl.int32) & 0x80
+    e32 = ((ux >> 23) & 0xFF).to(tl.int32)
+    frac = (ux & 0x7FFFFF).to(tl.int32)
+
+    # Normals |x| >= 2^-6: e4m3 exp = fp32 exp - 120 (bias 127 vs 7); RNE the
+    # top 3 mantissa bits, carrying into the exponent on overflow.
+    m = frac >> 20
+    rem = frac & 0xFFFFF
+    round_up = (rem > 0x80000) | ((rem == 0x80000) & ((m & 1) != 0))
+    m = m + round_up.to(tl.int32)
+    carry = (m == 8).to(tl.int32)
+    norm_bits = ((e32 - 120 + carry) << 3) | tl.where(carry != 0, 0, m)
+
+    # Subnormals |x| < 2^-6: RNE of |x| * 2^9 to an integer (the 2^23 + 2^22
+    # magic add rounds to nearest even); 8 carries into the first normal.
+    f = tl.abs(x) * 512.0
+    m_sub = ((f + 12582912.0) - 12582912.0).to(tl.int32)
+
+    bits = tl.where(e32 < 121, m_sub, norm_bits)
+    # Saturation matches torch/c10 (2.13): everything |x| >= 448-that-rounds-up
+    # including inf saturates to max finite 0x7E; only NaN inputs map to 0x7F.
+    sat = (e32 >= 136) | ((e32 == 135) & (frac >= 0x600000)) | (e32 == 255)
+    nan_out = (e32 == 255) & (frac != 0)
+    bits = tl.where(nan_out, 0x7F, tl.where(sat, 0x7E, bits))
+    return (sign | bits).to(tl.uint8)
 
 
 @triton.jit
@@ -276,7 +312,14 @@ def paged_fp8_mqa_logits_cuda(
 
 
 def sglang_paged_mqa_logits(
-    q, kv_cache, weights, seq_lens, page_table, deep_gemm_metadata, max_seq_len, use_fp4=False
+    q,
+    kv_cache,
+    weights,
+    seq_lens,
+    page_table,
+    deep_gemm_metadata,
+    max_seq_len,
+    use_fp4=False,
 ):
     """DeepGEMM `fp8_paged_mqa_logits` signature adapter for sm_80.
 

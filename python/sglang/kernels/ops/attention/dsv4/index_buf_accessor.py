@@ -51,7 +51,7 @@ def _set_k_and_s_triton(
     nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     page_size: int,
 ):
-    num_pages, buf_numel_per_page = buf.shape
+    _num_pages, buf_numel_per_page = buf.shape
     (num_tokens_to_write,) = loc.shape
 
     k_nope, k_rope, scale_k_nope = (
@@ -84,7 +84,8 @@ def _set_k_and_s_triton(
     assert k_rope.is_contiguous()
     assert scale_k_nope.is_contiguous()
 
-    buf_fp8 = buf.view(fp8_dtype)
+    # uint8 + bf16 views only: Triton rejects fp8e4nv pointers on sm_80, and
+    # the nope copy is a byte move anyway (k_nope passed via a uint8 view).
     buf_bf16 = buf.view(torch.bfloat16)
     buf_uint8 = buf.view(torch.uint8)
 
@@ -92,11 +93,10 @@ def _set_k_and_s_triton(
     s_offset_nbytes_in_page = page_size * (nope_dim + rope_dim * 2)
 
     _set_k_and_s_triton_kernel[(num_tokens_to_write,)](
-        buf_fp8,
         buf_bf16,
         buf_uint8,
         loc,
-        k_nope,
+        k_nope.view(torch.uint8),
         k_rope,
         scale_k_nope,
         k_nope.stride(0),
@@ -118,11 +118,10 @@ def _set_k_and_s_triton(
 
 @triton.jit
 def _set_k_and_s_triton_kernel(
-    buf_fp8_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
     loc_ptr,
-    k_nope_ptr,
+    k_nope_u8_ptr,
     k_rope_ptr,
     scale_k_nope_ptr,
     k_nope_ptr_stride_0,
@@ -146,7 +145,7 @@ def _set_k_and_s_triton_kernel(
     nope_range = tl.arange(0, BLOCK_NOPE)
     nope_mask = nope_range < NUM_NOPE_ELEMS_PER_TOKEN
     in_k_nope_offsets = token_id * k_nope_ptr_stride_0 + nope_range
-    k_nope = tl.load(k_nope_ptr + in_k_nope_offsets, mask=nope_mask, other=0.0)
+    k_nope = tl.load(k_nope_u8_ptr + in_k_nope_offsets, mask=nope_mask, other=0)
 
     rope_range = tl.arange(0, BLOCK_ROPE)
     in_k_rope_offsets = token_id * k_rope_ptr_stride_0 + rope_range
@@ -180,7 +179,7 @@ def _set_k_and_s_triton_kernel(
         + scale_range
     )
 
-    tl.store(buf_fp8_ptr + out_k_nope_offsets, k_nope, mask=nope_mask)
+    tl.store(buf_uint8_ptr + out_k_nope_offsets, k_nope, mask=nope_mask)
     tl.store(buf_bf16_ptr + out_k_rope_offsets, k_rope)
     tl.store(buf_uint8_ptr + out_s_offsets, k_scale, mask=scale_mask)
 
@@ -191,7 +190,7 @@ def _set_k_and_s_torch(
     nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     page_size: int,
 ):
-    num_pages, buf_numel_per_page = buf.shape
+    _num_pages, buf_numel_per_page = buf.shape
     (num_tokens_to_write,) = loc.shape
 
     k_nope, k_rope, scale_k_nope = (
@@ -209,7 +208,9 @@ def _set_k_and_s_torch(
         == num_tokens_to_write_nope
         == num_tokens_to_write_rope
         == num_tokens_to_write_scale
-    ), f"{num_tokens_to_write=} {num_tokens_to_write_nope=} {num_tokens_to_write_rope=} {num_tokens_to_write_scale=}"
+    ), (
+        f"{num_tokens_to_write=} {num_tokens_to_write_nope=} {num_tokens_to_write_rope=} {num_tokens_to_write_scale=}"
+    )
 
     assert buf.dtype == torch.uint8
     assert loc.dtype in [
