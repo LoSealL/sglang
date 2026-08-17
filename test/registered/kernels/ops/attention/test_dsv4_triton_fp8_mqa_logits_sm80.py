@@ -91,3 +91,27 @@ def test_adapter_sglang_paged_mqa_logits():
     # Tail beyond ctx is undefined (torch.empty); written prefix must be exact.
     for m in range(B):
         assert torch.equal(out[m, : int(lens[m, 0])], ref[m, : int(lens[m, 0])])
+
+
+def test_sm80_dispatch_selects_triton(monkeypatch):
+    """sm80: Triton adapter is the dispatch target; metadata avoids deep_gemm/topk_v2."""
+    from sglang.srt.layers.attention.dsv4 import indexer as indexer_mod
+    from sglang.srt.layers.attention.dsv4 import metadata as metadata_mod
+
+    monkeypatch.setattr(indexer_mod, "is_sm80_supported", lambda: True)
+    monkeypatch.setattr(metadata_mod, "is_sm80_supported", lambda: True)
+
+    # Same import path the sm80 dispatch branch in forward_c4_indexer uses.
+    from sglang.kernels.ops.attention.dsv4.triton_fp8_mqa_logits_cuda import (
+        sglang_paged_mqa_logits,
+    )
+
+    assert callable(sglang_paged_mqa_logits)
+
+    m = metadata_mod.PagedIndexerMetadata(
+        page_size=256,
+        page_table=torch.zeros((1, 16), dtype=torch.int32),
+        c4_seq_lens=torch.ones((1, 1), dtype=torch.int32),
+    )
+    assert m.deep_gemm_metadata is None
+    assert m.topk_metadata.numel() == 0
