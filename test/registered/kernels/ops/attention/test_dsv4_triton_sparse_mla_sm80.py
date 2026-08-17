@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     NOPE_ROPE_BYTES,
     PADDED_SCALE_PER_TOKEN,
     dequantize_k_cache_paged,
+    dequantize_k_cache_paged_ref,
 )
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import SetKAndS
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
@@ -120,3 +121,20 @@ def test_swa_only():
     )
     ref = _ref_attn(q, swa_k, sm, sink, idx, ln)
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+
+
+def test_pool_roundtrip_bit_exact():
+    """Quantize -> SetKAndS pool -> Triton dequant is bit-equal to the pure-torch
+    ref: pins cross-arch bit-exactness without needing Hopper."""
+    torch.manual_seed(7)
+    rows, page = 384, 128
+    k = torch.randn(rows, 512, dtype=torch.bfloat16, device="cuda")
+    pack = quant_to_nope_fp8_rope_bf16_pack_triton(k)
+    raw = page * (NOPE_ROPE_BYTES + PADDED_SCALE_PER_TOKEN)
+    bpp = -(-raw // NOPE_ROPE_BYTES) * NOPE_ROPE_BYTES  # ceil to a 576 multiple
+    buf = torch.zeros(rows // page, bpp, dtype=torch.uint8, device="cuda")
+    locs = torch.arange(rows, dtype=torch.int32, device="cuda")
+    SetKAndS.execute(types.SimpleNamespace(page_size=page), buf, locs, pack)
+    out = dequantize_k_cache_paged(buf, locs, page)
+    ref = dequantize_k_cache_paged_ref(buf, locs, page)
+    assert torch.equal(out, ref)

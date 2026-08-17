@@ -1746,7 +1746,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+        # deep_gemm's tf32_hc_prenorm_gemm (inside _flashinfer_hc_pre) is
+        # Hopper-only; fall back to the sm80-safe paths below.
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get() and not is_sm80_supported():
             y, post, comb = _flashinfer_hc_pre(
                 x,
                 hc_fn,

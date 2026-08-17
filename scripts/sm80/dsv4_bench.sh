@@ -21,7 +21,7 @@ mkdir -p "$(dirname "$RESULT")"
 gpu_util() { nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader | head -1; }
 
 for i in $(seq 1 "$REPEATS"); do
-  echo "=== repeat $i/  $REPEATS ==="
+  echo "=== repeat $i/$REPEATS ==="
   echo "GPU util before: $(gpu_util)"
   # ponytail: mem-fraction 0.55 keeps headroom under the foreign training job
   .venv/bin/python -m sglang.benchmark.one_batch \

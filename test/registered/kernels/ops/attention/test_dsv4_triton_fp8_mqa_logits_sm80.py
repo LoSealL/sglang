@@ -93,7 +93,7 @@ def test_adapter_sglang_paged_mqa_logits():
         assert torch.equal(out[m, : int(lens[m, 0])], ref[m, : int(lens[m, 0])])
 
 
-def test_sm80_dispatch_selects_triton(monkeypatch):
+def test_sm80_metadata_gating_and_kernel_importable(monkeypatch):
     """sm80: Triton adapter is the dispatch target; metadata avoids deep_gemm/topk_v2."""
     from sglang.srt.layers.attention.dsv4 import indexer as indexer_mod
     from sglang.srt.layers.attention.dsv4 import metadata as metadata_mod

@@ -710,6 +710,10 @@ class C4IndexerBackendMixin:
         weights = weights.squeeze(2)
         if use_fp4_indexer:
             weights = weights.float()
+            if is_sm80_supported():
+                raise RuntimeError(
+                    "FP4 indexer requires DeepGEMM (Hopper+); not available on SM80"
+                )
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn

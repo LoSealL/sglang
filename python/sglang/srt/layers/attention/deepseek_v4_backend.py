@@ -1848,6 +1848,11 @@ class DeepseekV4AttnBackend(
         if compress_ratio != 0:
             comp_buf = token_to_kv_pool.get_extra_key_buffer(layer_id)
             comp_page = token_to_kv_pool.page_size // compress_ratio
+            assert (
+                comp_buf is not None
+                and comp_indices is not None
+                and comp_lens is not None
+            ), "compress_ratio!=0 requires compressed-cache metadata"
         if comp_buf is not None and comp_buf.dtype != torch.uint8:
             comp_buf = comp_buf.view(torch.uint8)
         out_cache = q.new_empty((q.shape[0], q.shape[1], self.head_dim_v))
