@@ -16,6 +16,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils.common import is_sm80_supported
 
 logger = logging.getLogger(__name__)
 
@@ -833,7 +834,9 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    # deep_gemm's tf32_hc_prenorm_gemm is Hopper-only ("Unsupported
+    # architecture" on sm80); the TileLang splitk/simple GEMM below is sm80-safe.
+    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() and not is_sm80_supported():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1445,7 +1448,9 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        # deep_gemm's tf32_hc_prenorm_gemm is Hopper-only ("Unsupported
+        # architecture" on sm80); the TileLang fallback below is sm80-safe.
+        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() and not is_sm80_supported():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(
