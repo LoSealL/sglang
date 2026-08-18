@@ -102,15 +102,34 @@ Streaming decode @98k (2026-08-18, chat API, thinking on, idle GPUs): steady-sta
 (radix cache). The user-reported "~1 tps" is TTFT amortization over a short output:
 58 completion tokens / 44.5 s wall = 1.30 tok/s. Same request cached: 12.0 tok/s
 amortized. No decode regression; prefix reuse dominates perceived speed.
+**Post KV-split fix (commit `b45190e6f0`): steady decode @98k is 53.5 tok/s (4.0×)**
+— the paged fp8 MQA logits kernel went from a 1-CTA grid to
+`(rows, ceil(max_len/128))`; see
+[KV-split logits optimization](#kv-split-logits-optimization-2026-08-18).
 
 Earlier pre-fix numbers (kept for the record): onset of retrieval loss at 16384 with
 coherent-denial failures, degenerate decode at 100k — fully explained by the layout
 bug above; the fp8-KV and chunked-prefill suspects were ruled out (same reports).
 
-Idle-GPU benchmark medians (3 repeats, `scripts/sm80/dsv4_bench.sh`, post-fix): prefill
-32×1536 **6358 tok/s** (gate ≥1000, PASS); decode bs=1 @8k ctx **49.0 tok/s** (gate
-≥50, marginal FAIL — improved from 40.6 pre-fix). Profiling verdict: predominantly
-GPU-bound (80.7% kernel coverage per decode step; sparse-MLA + paged-MQA-logits
-kernels ≈ 62% of busy time, ~19% host-side segment tax under the piecewise cuda
-graph). Other medians: decode bs=1 @1.5k ctx 62.9 tok/s; @16k ctx 39.4 tok/s; decode
-bs=32 @1536 1115 tok/s.
+Idle-GPU benchmark medians (3 repeats, `scripts/sm80/dsv4_bench.sh`, post-layout-fix):
+prefill 32×1536 **6358 tok/s** (gate ≥1000, PASS); decode bs=1 @8k ctx **49.0 tok/s**
+(gate ≥50, marginal FAIL — improved from 40.6 pre-fix). Profiling verdict:
+predominantly GPU-bound (80.7% kernel coverage per decode step; sparse-MLA +
+paged-MQA-logits kernels ≈ 62% of busy time, ~19% host-side segment tax under the
+piecewise cuda graph). Other medians: decode bs=1 @1.5k ctx 62.9 tok/s; @16k ctx
+39.4 tok/s; decode bs=32 @1536 1115 tok/s.
+
+## KV-split logits optimization (2026-08-18)
+
+Profiling @98k ctx showed `_paged_fp8_mqa_logits` = 43.3 ms/step (70.9% of GPU busy):
+the sm80 Triton kernel launched grid `(B*next_n,)` = **1 CTA at bs=1** (1/108 SMs)
+and sequentially scanned ctx/4 = 24.5k rows in BLOCK_KV=64 chunks. The n-dimension is
+embarrassingly parallel (each logits[m,n] is written by exactly one CTA), so the grid
+is now `(B*next_n, ceil(max_len/SPLIT_KV))`, `SPLIT_KV=128` (tuned: fastest at decode
+ctx 8k/24.5k; splits past a row's ctx exit immediately; the top-k consumer scans
+bounded by seq_lens). Micro-bench idle A100: ctx 8192 **1.068 → 0.068 ms (16×)**,
+ctx 24576 **3.091 → 0.070 ms (44×)**.
+
+Post-fix numbers (idle GPUs): decode @98k steady **53.5 tok/s** (server-side; was
+13.2–13.4); decode bs=1 @8k gate **63.2 tok/s** median of 3 (was 49.0; gate ≥49 PASS).
+Prefill untouched. Evidence: `.superpowers/sdd/task-10-report.md`.
