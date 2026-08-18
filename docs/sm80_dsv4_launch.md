@@ -133,3 +133,17 @@ ctx 24576 **3.091 → 0.070 ms (44×)**.
 Post-fix numbers (idle GPUs): decode @98k steady **53.5 tok/s** (server-side; was
 13.2–13.4); decode bs=1 @8k gate **63.2 tok/s** median of 3 (was 49.0; gate ≥49 PASS).
 Prefill untouched. Evidence: `.superpowers/sdd/task-10-report.md`.
+
+### Prefill: BLOCK_M-tiled paged MQA logits (commit `588a5c8d26`, 2026-08-19)
+
+Prefill chunks re-decoded every KV byte per query row and ran the indexer logits
+as `[64,128]x[128,64]` dots (~8-10% TC peak). The tiled kernel (`M >= 32` rows
+routes to it; decode keeps the per-row kernel) decodes each 64-row KV block once
+and runs one `[BLOCK_M*64,128]x[128,64]` GEMM per block. Bitwise-equal to the
+per-row kernel (fixed pairwise head-reduction tree + `enable_fp_fusion=False`;
+see `.superpowers/sdd/task-10-report.md`).
+
+Micro-bench M=8192 (kernel-side, c4 ctx 2048/6144/24576): **13.5/37.5/131.5 ms
+→ 5.4/16.0/63.7 ms (2.1-2.5x)**. E2E @~100k prompt: per-chunk input tok/s
+3516→3920 (8k ctx), 2094→2657 (49k), 1582→2115 (81k, +34%); **TTFT 40.5 s →
+35.6-38.3 s cold**. Decode unchanged: 53.2 tok/s @98k steady.
