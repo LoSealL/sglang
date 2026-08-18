@@ -146,6 +146,86 @@ def test_paged_sglang_block_layout():
             torch.testing.assert_close(out[b, :ctx], ref, rtol=2e-3, atol=2e-3)
 
 
+def _block_layout_pool(pages, block):
+    """fp8 values + scales written in sglang block layout (store.cuh)."""
+    x = torch.randn(pages, block, D, device="cuda")
+    sc = (x.abs().amax(-1) / 448).clamp(min=1e-4)
+    vals = (x / sc[..., None]).to(torch.float8_e4m3fn)
+    buf = torch.zeros(pages, block * (D + 4), dtype=torch.uint8, device="cuda")
+    buf[:, : block * D] = vals.view(torch.uint8).reshape(pages, -1)
+    buf[:, block * D :] = sc.contiguous().view(torch.uint8).reshape(pages, -1)
+    return buf
+
+
+def _block_layout_ref(buf, bt, b, ctx, q, w, block):
+    vals_dec = buf[:, : block * D].reshape(-1, block, D).view(torch.float8_e4m3fn).float()
+    sc_dec = buf[:, block * D :].view(torch.float32)
+    n = torch.arange(ctx, device="cuda")
+    k = vals_dec[bt[b, n // block], n % block]
+    s = sc_dec[bt[b, n // block], n % block]
+    qf = q[b, 0].float().to(torch.bfloat16).float()
+    kb = k.to(torch.bfloat16).float()
+    return (torch.relu(torch.einsum("hd,nd->hn", qf, kb)) * s * w[b][:, None]).sum(0)
+
+
+def test_paged_splitkv_parallel():
+    """2D grid (rows, KV splits): multi-CTA execution must be bitwise-identical
+    to single-split (sequential) execution and match the fp32 ref. Covers split
+    boundaries on/off SPLIT_KV and block_size multiples (255/256/257) and empty
+    splits when ctx < max_len."""
+    torch.manual_seed(0)
+    block, B = 64, 5
+    ctxs = [1, 255, 256, 257, 1000]
+    pages_per_row, max_len = 16, 1024
+    buf = _block_layout_pool(B * pages_per_row, block)
+    bt = (
+        torch.arange(B, device="cuda", dtype=torch.int32)[:, None] * pages_per_row
+        + torch.arange(pages_per_row, device="cuda", dtype=torch.int32)[None, :]
+    )
+    q = (torch.randn(B, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+    w = torch.randn(B, H, device="cuda")
+    lens = torch.tensor([[c] for c in ctxs], device="cuda", dtype=torch.int32)
+
+    seq = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len, split_kv=max_len)
+    par = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len, split_kv=256)
+    for b, ctx in enumerate(ctxs):
+        assert torch.equal(seq[b, :ctx], par[b, :ctx])
+        torch.testing.assert_close(
+            par[b, :ctx],
+            _block_layout_ref(buf, bt, b, ctx, q, w, block),
+            rtol=2e-3,
+            atol=2e-3,
+        )
+
+    # Large ctx, minimal pool: 40000 rows not divisible by SPLIT_KV=512.
+    pages, big_ctx, big_max = 640, 40000, 40960
+    buf2 = _block_layout_pool(pages, block)
+    bt2 = torch.arange(pages, device="cuda", dtype=torch.int32)[None, :]
+    q2 = (torch.randn(1, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+    w2 = torch.randn(1, H, device="cuda")
+    lens2 = torch.tensor([[big_ctx]], device="cuda", dtype=torch.int32)
+    seq2 = paged_fp8_mqa_logits_cuda(
+        q2, buf2, w2, lens2, bt2, big_max, split_kv=big_max
+    )
+    par2 = paged_fp8_mqa_logits_cuda(q2, buf2, w2, lens2, bt2, big_max, split_kv=512)
+    assert torch.equal(seq2[0, :big_ctx], par2[0, :big_ctx])
+
+    # Perf sanity at decode-scale ctx: < 1.5 ms (single-CTA baseline is 3.12 ms).
+    bench_ctx = 24576
+    lens3 = torch.tensor([[bench_ctx]], device="cuda", dtype=torch.int32)
+    start_e, end_e = torch.cuda.Event(True), torch.cuda.Event(True)
+    for _ in range(5):
+        paged_fp8_mqa_logits_cuda(q2, buf2, w2, lens3, bt2, bench_ctx)
+    times = []
+    for _ in range(50):
+        start_e.record()
+        paged_fp8_mqa_logits_cuda(q2, buf2, w2, lens3, bt2, bench_ctx)
+        end_e.record()
+        torch.cuda.synchronize()
+        times.append(start_e.elapsed_time(end_e))
+    assert sorted(times)[25] < 1.5, f"kernel too slow: {sorted(times)[25]:.3f} ms"
+
+
 def test_sm80_metadata_gating_and_kernel_importable(monkeypatch):
     """sm80: Triton adapter is the dispatch target; metadata avoids deep_gemm/topk_v2."""
     from sglang.srt.layers.attention.dsv4 import indexer as indexer_mod

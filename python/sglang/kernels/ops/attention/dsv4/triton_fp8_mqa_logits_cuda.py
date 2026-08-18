@@ -192,6 +192,7 @@ def _paged_fp8_mqa_logits_cuda_kernel(
     max_ctx,
     block_size,
     next_n,
+    split_kv,
     NUM_HEADS: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     NUM_HEADS_PADDED: tl.constexpr,
@@ -203,52 +204,76 @@ def _paged_fp8_mqa_logits_cuda_kernel(
     stride_cache_b,  # bytes per page: block layout [block_size*HEAD_SIZE values | block_size*4 scales]
 ):
     row = tl.program_id(0)
+    split = tl.program_id(1)
     b = row // next_n
     ctx = tl.load(Ctx_ptr + row)
-    offs_h = tl.arange(0, NUM_HEADS_PADDED)
-    h_mask = offs_h < NUM_HEADS
-    offs_d = tl.arange(0, HEAD_SIZE)
-    q = _fp8e4m3_to_f32(
-        tl.load(
-            Q_ptr + row * stride_q_m + offs_h[:, None] * HEAD_SIZE + offs_d[None, :],
-            mask=h_mask[:, None],
-            other=0,
-        )
-    ).to(tl.bfloat16)
-    w = tl.load(W_ptr + row * stride_w_m + offs_h, mask=h_mask, other=0.0)
-
-    for start_n in tl.range(0, ctx, BLOCK_KV):
-        offs_n = start_n + tl.arange(0, BLOCK_KV)
-        mask = offs_n < ctx
-        blocks = tl.load(
-            BlockTable_ptr + b * stride_bt_b + offs_n // block_size,
-            mask=mask,
-            other=0,
-        ).to(tl.int64)
-        page_off = offs_n % block_size
-        # sglang block layout (kernels/jit .../store.cuh fused_store_cache):
-        # value row at page + off*HEAD_SIZE, scale at
-        # page + block_size*HEAD_SIZE + off*4. All offsets 4B-aligned.
-        row_bytes = blocks * stride_cache_b + page_off * HEAD_SIZE
-        kv = _fp8e4m3_to_f32(
+    start = split * split_kv
+    if start < ctx:
+        end = tl.minimum(start + split_kv, ctx)
+        offs_h = tl.arange(0, NUM_HEADS_PADDED)
+        h_mask = offs_h < NUM_HEADS
+        offs_d = tl.arange(0, HEAD_SIZE)
+        q = _fp8e4m3_to_f32(
             tl.load(
-                Cache_ptr + row_bytes[None, :] + offs_d[:, None],
-                mask=mask[None, :],
+                Q_ptr
+                + row * stride_q_m
+                + offs_h[:, None] * HEAD_SIZE
+                + offs_d[None, :],
+                mask=h_mask[:, None],
                 other=0,
             )
         ).to(tl.bfloat16)
-        scale_bytes = blocks * stride_cache_b + block_size * HEAD_SIZE + page_off * 4
-        sc = tl.load(
-            Cache_ptr.to(tl.pointer_type(tl.float32)) + scale_bytes // 4,
-            mask=mask,
-            other=0.0,
-        )
-        scores = _mqa_logits_inner(q, kv, sc, w, BLOCK_KV)
-        tl.store(Logits_ptr + row * stride_logits_m + offs_n, scores, mask=mask)
+        w = tl.load(W_ptr + row * stride_w_m + offs_h, mask=h_mask, other=0.0)
+
+        for start_n in tl.range(start, end, BLOCK_KV):
+            offs_n = start_n + tl.arange(0, BLOCK_KV)
+            mask = offs_n < end
+            blocks = tl.load(
+                BlockTable_ptr + b * stride_bt_b + offs_n // block_size,
+                mask=mask,
+                other=0,
+            ).to(tl.int64)
+            page_off = offs_n % block_size
+            # sglang block layout (kernels/jit .../store.cuh fused_store_cache):
+            # value row at page + off*HEAD_SIZE, scale at
+            # page + block_size*HEAD_SIZE + off*4. All offsets 4B-aligned.
+            row_bytes = blocks * stride_cache_b + page_off * HEAD_SIZE
+            kv = _fp8e4m3_to_f32(
+                tl.load(
+                    Cache_ptr + row_bytes[None, :] + offs_d[:, None],
+                    mask=mask[None, :],
+                    other=0,
+                )
+            ).to(tl.bfloat16)
+            scale_bytes = (
+                blocks * stride_cache_b + block_size * HEAD_SIZE + page_off * 4
+            )
+            sc = tl.load(
+                Cache_ptr.to(tl.pointer_type(tl.float32)) + scale_bytes // 4,
+                mask=mask,
+                other=0.0,
+            )
+            scores = _mqa_logits_inner(q, kv, sc, w, BLOCK_KV)
+            tl.store(Logits_ptr + row * stride_logits_m + offs_n, scores, mask=mask)
+
+
+# KV rows per CTA (grid axis 1 = ceil(max_len / _SPLIT_KV)); each CTA writes a
+# disjoint logits slice, so any value is correct — measured fastest at decode
+# ctx 8k/24.5k on idle A100-80GB (128: 0.079/0.075 ms; 256: 0.093/0.084 ms;
+# 512: 0.116/0.117 ms; 1024: 0.179/0.180 ms): bs=1 decode needs ~200 CTAs to
+# fill 108 SMs; the kernel is per-CTA-overhead bound, so more/smaller splits win.
+_SPLIT_KV = 128
 
 
 def paged_fp8_mqa_logits_cuda(
-    q, kv_cache, weights, context_lens, block_tables, max_len, block_size=64
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_tables,
+    max_len,
+    block_size=64,
+    split_kv=None,
 ):
     """Paged fp8 MQA logits (decode call site).
 
@@ -270,6 +295,8 @@ def paged_fp8_mqa_logits_cuda(
         max_len: Static row width for the output (``max_model_len``); avoids
             a ``tensor.max()`` host sync per call.
         block_size: Rows per cache page (indexer pool: 64).
+        split_kv: KV rows per CTA along grid axis 1 (default: tuned
+            ``_SPLIT_KV``). Splits beyond a row's ctx exit immediately.
 
     Returns:
         Logits ``[B * next_n, max_len]`` float32. Only ``[0, ctx)`` per row
@@ -295,7 +322,10 @@ def paged_fp8_mqa_logits_cuda(
     assert weights.stride(1) == 1 and block_tables.stride(1) == 1
     ctx_flat = context_lens.reshape(-1)
     logits = torch.empty((B * next_n, max_len), dtype=torch.float32, device=q.device)
-    _paged_fp8_mqa_logits_cuda_kernel[(B * next_n,)](
+    if split_kv is None:
+        split_kv = _SPLIT_KV
+    splits = (max_len + split_kv - 1) // split_kv
+    _paged_fp8_mqa_logits_cuda_kernel[(B * next_n, splits)](
         q_flat.view(torch.uint8),
         kv_cache,
         weights,
@@ -305,6 +335,7 @@ def paged_fp8_mqa_logits_cuda(
         max_len,
         block_size,
         next_n,
+        split_kv,
         NUM_HEADS=num_heads,
         HEAD_SIZE=head_size,
         NUM_HEADS_PADDED=triton.next_power_of_2(max(num_heads, 16)),
