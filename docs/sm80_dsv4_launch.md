@@ -3,9 +3,10 @@
 First end-to-end port of DeepSeek-V4-Flash to sm80 (branch `feat/deepseek-v4-sm80`).
 Status: **smoke-tested end-to-end on A100 (TP=8) — PASS** (2026-08-18, under GPU
 contention from a foreign training job). See `.superpowers/sdd/task-7-report.md` for
-the debugging trail. Long-context and gate validation (2026-08-18): see
-[Long-context validation](#long-context-validation--2026-08-18) — **keep
-`--context-length 49152`; 100k is NOT validated**.
+the debugging trail. Long-context validation (2026-08-18, post-fix): see
+[Long-context validation](#long-context-validation--2026-08-18) — **100k is
+validated; `--context-length 102400` is allowed** after the paged MQA logits layout
+fix (commit `372c6f289a`).
 
 ## Launch command (final, as smoke-tested)
 
@@ -15,7 +16,7 @@ MODEL=/nvme2data/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f
   --model-path $MODEL --trust-remote-code \
   --tp 8 --attention-backend dsv4 --page-size 256 \
   --moe-runner-backend marlin \
-  --context-length 49152 --port 8000 --host 0.0.0.0 \
+  --context-length 102400 --port 8000 --host 0.0.0.0 \
   --mem-fraction-static 0.5 \
   --reasoning-parser deepseek-v4 --tool-call-parser deepseekv4 \
   > /tmp/opencode/sgl_server.log 2>&1 &
@@ -69,18 +70,27 @@ HTTP 200 with an empty body (not the string `ok`).
 
 ## Long-context validation (2026-08-18)
 
-100k-context serving launches fine (`--context-length 102400
---mem-fraction-static 0.72`, KV pool 4.57M tokens) but **fails correctness**:
-0/4 needle retrievals at 100k (facts at 5/35/65/95% depth are lost — the model
-confabulates same-shaped wrong answers), with onset of retrieval loss between
-12k and 48k tokens and degenerate decode output at 100k in raw-completions
-mode. This reproduces the vLLM ≥57k decode-garble bug class; fresh-cache and
-chat-template cross-checks rule out prefix-cache handling and prompt format.
-Until fixed, cap at `--context-length 49152`. First suspects: default fp8 KV
-cache without scaling factors, and paged-KV dequant paths (see
-`.superpowers/sdd/task-10-report.md` for the full evidence).
+**Post-fix (commit `372c6f289a`): 100k context is validated.** The sm80 Triton
+`paged_fp8_mqa_logits` kernel previously read the indexer cache with an interleaved
+row layout while the writer stores a block layout ([64×128B values][64×4B scales]
+per page) — misread scales (±1e30/NaN) poisoned top-k row selection, losing needles
+from 16k tokens onward. After the fix, a needle sweep (chat-encoded via the vLLM
+reference encoder, varied filler, depths 5% and 50%, temperature 0, token counts
+verified) passes **22/22 runs from 8192 through 98304 tokens** — no failure onset
+within `--context-length 102400`, exceeding the vLLM sm80 reference (which fails at
+49k@50% and ≥65k). Evidence trail: `.superpowers/sdd/task-10-report.md`.
 
-Idle-GPU benchmark medians (3 repeats, `scripts/sm80/dsv4_bench.sh`): prefill
-32×1536 **6236 tok/s** (gate ≥1000, PASS); decode bs=1 @8k ctx **40.6 tok/s**
-(gate ≥50, FAIL — regression to investigate); decode bs=1 @1.5k ctx 59.1 tok/s;
-decode bs=1 @16k ctx 29.7 tok/s. At 100k context: TTFT 57.6 s, decode 8.1 tok/s.
+100k perf (98k-token prompt, cache flushed): TTFT 40.5 s; decode 13.3 tok/s at 98k
+context (server-side gen throughput, cuda graphs on).
+
+Earlier pre-fix numbers (kept for the record): onset of retrieval loss at 16384 with
+coherent-denial failures, degenerate decode at 100k — fully explained by the layout
+bug above; the fp8-KV and chunked-prefill suspects were ruled out (same reports).
+
+Idle-GPU benchmark medians (3 repeats, `scripts/sm80/dsv4_bench.sh`, post-fix): prefill
+32×1536 **6358 tok/s** (gate ≥1000, PASS); decode bs=1 @8k ctx **49.0 tok/s** (gate
+≥50, marginal FAIL — improved from 40.6 pre-fix). Profiling verdict: predominantly
+GPU-bound (80.7% kernel coverage per decode step; sparse-MLA + paged-MQA-logits
+kernels ≈ 62% of busy time, ~19% host-side segment tax under the piecewise cuda
+graph). Other medians: decode bs=1 @1.5k ctx 62.9 tok/s; @16k ctx 39.4 tok/s; decode
+bs=32 @1536 1115 tok/s.
