@@ -2,6 +2,7 @@
 """sm80 DSV4 indexer fp8 MQA logits vs torch reference. Run: pytest -q <this file> (needs 1 GPU)."""
 import torch
 from sglang.kernels.ops.attention.dsv4.triton_fp8_mqa_logits_cuda import (
+    _TILE_M,
     fp8_mqa_logits_cuda,
     paged_fp8_mqa_logits_cuda,
     sglang_paged_mqa_logits,
@@ -243,6 +244,10 @@ def test_paged_tiled_matches_perrow():
             .contiguous()
         )
         bt[100:150] += 512  # second "request": own pages, tiles straddle at 96/104
+        # Slow-path (mixed-page within a KV block, lo != hi) coverage at the
+        # 101:150 straddle relies on tile-width arithmetic: shift start 100 is
+        # tile-aligned only for _TILE_M in {1,2,4,5,...}; pin it.
+        assert _TILE_M == 4, "straddle coverage at 101:150 assumes tile width 4"
         specials = [1, 7, 63, 64, 65, 127, 128, 129, 255, 256, 257, ctx_hi]
         ctxs = [specials[i % len(specials)] for i in range(M)]
         lens = torch.tensor([[c] for c in ctxs], device="cuda", dtype=torch.int32)
