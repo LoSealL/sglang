@@ -283,3 +283,51 @@ def test_sparse_mla_split_matches_single():
     torch.testing.assert_close(
         out_split, _ref_attn(q, swa_k, sm, sink, idx, ln), atol=3e-2, rtol=3e-2
     )
+
+    # All-empty token: swa_len=0 AND comp_len=0 (the split loop body never
+    # runs, so every partial is (m=-inf, l=0, acc=0)) with a -inf-sink head —
+    # the reducer's l=0 -> 1e-20 clamp and both--inf guard must yield exact
+    # 0, matching the single path. The torch ref max()s over an empty logit
+    # set, so assert against zeros instead.
+    T, H = 1, 8
+    q = torch.randn(T, H, 512, dtype=torch.bfloat16, device="cuda")
+    sink = torch.zeros(H, device="cuda")
+    sink[0] = float("-inf")
+    swa_idx = torch.full((T, 160), -1, device="cuda", dtype=torch.int32)
+    comp_idx = torch.full((T, 64), -1, device="cuda", dtype=torch.int32)
+    zero_len = torch.zeros(T, dtype=torch.int32, device="cuda")
+    zeros = torch.zeros_like(q)
+    out_single = torch.empty_like(q)
+    triton_sparse_mla_fwd(
+        q,
+        out_single,
+        swa_buf,
+        swa_idx,
+        zero_len,
+        comp_buf,
+        comp_idx,
+        zero_len,
+        sm,
+        sink,
+        swa_page=128,
+        comp_page=64,
+    )
+    torch.testing.assert_close(out_single, zeros, atol=3e-2, rtol=3e-2)
+    for S in (2, 4, 7):
+        out_split = torch.empty_like(q)
+        triton_sparse_mla_fwd(
+            q,
+            out_split,
+            swa_buf,
+            swa_idx,
+            zero_len,
+            comp_buf,
+            comp_idx,
+            zero_len,
+            sm,
+            sink,
+            swa_page=128,
+            comp_page=64,
+            num_splits=S,
+        )
+        torch.testing.assert_close(out_split, zeros, atol=3e-2, rtol=3e-2)

@@ -435,8 +435,10 @@ def triton_sparse_mla_fwd(
     num_splits>1 routes to the split-K path (one CTA per (token, split,
     head-tile) plus a logsumexp reduce kernel); num_splits=None auto-enables
     it only for prefill-sized batches with long per-token index lists (c4/c128
-    chunks) — decode keeps the single-CTA-per-token path. Writes and returns
-    ``out``.
+    chunks) — decode keeps the single-CTA-per-token path. The split path
+    allocates a fp32 partials workspace that grows as
+    T·num_splits·head_tiles·16·512 (≈8.6GB at T=8192/S=8/H=64) — callers
+    must budget it. Writes and returns ``out``.
     """
     T, H, head_dim = q.shape
     assert head_dim == 512, f"expected head_dim 512, got {head_dim}"
