@@ -1,5 +1,6 @@
 # test/registered/kernels/ops/attention/test_dsv4_triton_fp8_mqa_logits_sm80.py
 """sm80 DSV4 indexer fp8 MQA logits vs torch reference. Run: pytest -q <this file> (needs 1 GPU)."""
+
 import torch
 from sglang.kernels.ops.attention.dsv4.triton_fp8_mqa_logits_cuda import (
     _TILE_M,
@@ -12,12 +13,15 @@ H, D = 64, 128
 
 
 def _ref(q, k, kv_scales, weights, starts, ends, N):
-    qf = q.float(); kf = k.float()
+    qf = q.float()
+    kf = k.float()
     logits = torch.full((q.shape[0], N), -float("inf"), device=q.device)
     for m in range(q.shape[0]):
         s, e = int(starts[m]), min(int(ends[m]), N)
         if e > s:
-            dots = (torch.relu((qf[m] @ kf[s:e].T) * kv_scales[s:e]) * weights[m][:, None]).sum(0)
+            dots = (
+                torch.relu((qf[m] @ kf[s:e].T) * kv_scales[s:e]) * weights[m][:, None]
+            ).sum(0)
             logits[m, s:e] = dots
     return logits
 
@@ -34,10 +38,12 @@ def test_contiguous():
     out = fp8_mqa_logits_cuda(q, k, sc, w, starts, ends)
     # fp8->bf16 dot vs fp32 ref: rel tolerance is loose, layout correctness is the point
     torch.testing.assert_close(
-        out[:, : int(ends.min())], _ref(q, k, sc, w, starts, ends, N)[:, : int(ends.min())],
-        atol=0.5, rtol=0.05,
+        out[:, : int(ends.min())],
+        _ref(q, k, sc, w, starts, ends, N)[:, : int(ends.min())],
+        atol=0.5,
+        rtol=0.05,
     )
-    assert torch.isinf(out[0, int(ends[0]):]).all()
+    assert torch.isinf(out[0, int(ends[0]) :]).all()
 
 
 def test_paged_garbage_tail():
@@ -48,11 +54,17 @@ def test_paged_garbage_tail():
     # Byte 0x7F is NaN in e4m3fn; garbage values must stay finite for the ref
     # decode, garbage scales sane so magnitudes stay comparable. Block layout
     # per page: [block x D value bytes | block x 4B fp32 scales].
-    buf = torch.randint(0, 254, (pages, block * (D + 4)), dtype=torch.uint8, device="cuda")
+    buf = torch.randint(
+        0, 254, (pages, block * (D + 4)), dtype=torch.uint8, device="cuda"
+    )
     buf[buf == 127] = 126
-    buf[:, block * D :] = (torch.rand(pages, block, device="cuda") + 0.5).view(torch.uint8)
+    buf[:, block * D :] = (torch.rand(pages, block, device="cuda") + 0.5).view(
+        torch.uint8
+    )
     w = torch.randn(B, H, device="cuda")
-    lens = torch.tensor([[ctx], [7], [64], [65], [399]], device="cuda", dtype=torch.int32)
+    lens = torch.tensor(
+        [[ctx], [7], [64], [65], [399]], device="cuda", dtype=torch.int32
+    )
     bt = torch.randint(0, pages, (B, 16), device="cuda", dtype=torch.int32)
     out = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len=512)
     assert out.shape == (B, 512)
@@ -63,8 +75,13 @@ def test_paged_garbage_tail():
     def dec_row(b, n):
         base = bt[b, n // block].item() * page_bytes
         vals = u8[base + (n % block) * D : base + (n % block) * D + D]
-        scale = u8[base + block * D + (n % block) * 4 : base + block * D + (n % block) * 4 + 4]
-        return vals.view(torch.float8_e4m3fn).float() * scale.view(torch.float32).float().item()
+        scale = u8[
+            base + block * D + (n % block) * 4 : base + block * D + (n % block) * 4 + 4
+        ]
+        return (
+            vals.view(torch.float8_e4m3fn).float()
+            * scale.view(torch.float32).float().item()
+        )
 
     k0 = torch.stack([dec_row(0, n) for n in range(ctx)])
     ref0 = (torch.relu(q[0, 0].float() @ k0.T) * w[0][:, None]).sum(0)
@@ -78,11 +95,17 @@ def test_adapter_sglang_paged_mqa_logits():
     q = (torch.randn(B, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
     # Pool buffer like get_index_k_with_scale_buffer: raw [pages, 64*(D+4)]
     # uint8 in sglang block layout (values block, then scales block, per page).
-    buf = torch.randint(0, 254, (pages, block * (D + 4)), dtype=torch.uint8, device="cuda")
+    buf = torch.randint(
+        0, 254, (pages, block * (D + 4)), dtype=torch.uint8, device="cuda"
+    )
     buf[buf == 127] = 126
-    buf[:, block * D :] = (torch.rand(pages, block, device="cuda") + 0.5).view(torch.uint8)
+    buf[:, block * D :] = (torch.rand(pages, block, device="cuda") + 0.5).view(
+        torch.uint8
+    )
     w = torch.randn(B, H, device="cuda")
-    lens = torch.tensor([[400], [7], [64], [65], [399]], device="cuda", dtype=torch.int32)
+    lens = torch.tensor(
+        [[400], [7], [64], [65], [399]], device="cuda", dtype=torch.int32
+    )
     bt = torch.randint(0, pages, (B, 16), device="cuda", dtype=torch.int32)
     out = sglang_paged_mqa_logits(q, buf, w, lens, bt, None, 512)
     assert out.shape == (B, 512) and out.dtype == torch.float32
@@ -129,7 +152,9 @@ def test_paged_sglang_block_layout():
     w = torch.randn(B, H, device="cuda")
     lens = torch.tensor([[c] for c in ctxs], device="cuda", dtype=torch.int32)
 
-    vals_dec = buf[:, : block * D].reshape(pages, block, D).view(torch.float8_e4m3fn).float()
+    vals_dec = (
+        buf[:, : block * D].reshape(pages, block, D).view(torch.float8_e4m3fn).float()
+    )
     sc_dec = buf[:, block * D :].view(torch.float32)
     outs = [
         paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len=512),
@@ -143,7 +168,9 @@ def test_paged_sglang_block_layout():
             # kernel decodes fp8 -> bf16 before the dot; mirror that in the ref
             qf = q[b, 0].float().to(torch.bfloat16).float()
             kb = k.to(torch.bfloat16).float()
-            ref = (torch.relu(torch.einsum("hd,nd->hn", qf, kb)) * s * w[b][:, None]).sum(0)
+            ref = (
+                torch.relu(torch.einsum("hd,nd->hn", qf, kb)) * s * w[b][:, None]
+            ).sum(0)
             torch.testing.assert_close(out[b, :ctx], ref, rtol=2e-3, atol=2e-3)
 
 
@@ -159,7 +186,9 @@ def _block_layout_pool(pages, block):
 
 
 def _block_layout_ref(buf, bt, b, ctx, q, w, block):
-    vals_dec = buf[:, : block * D].reshape(-1, block, D).view(torch.float8_e4m3fn).float()
+    vals_dec = (
+        buf[:, : block * D].reshape(-1, block, D).view(torch.float8_e4m3fn).float()
+    )
     sc_dec = buf[:, block * D :].view(torch.float32)
     n = torch.arange(ctx, device="cuda")
     k = vals_dec[bt[b, n // block], n % block]
@@ -275,12 +304,18 @@ def test_paged_tiled_matches_perrow():
         .expand(M, -1)
         .contiguous()
     )
-    lens = torch.tensor([[5], [64], [65], [1], [1000]], device="cuda", dtype=torch.int32)
+    lens = torch.tensor(
+        [[5], [64], [65], [1], [1000]], device="cuda", dtype=torch.int32
+    )
     q = (torch.randn(M, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
     w = torch.randn(M, H, device="cuda")
-    out_row = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, 1024, force_row_kernel=True)
+    out_row = paged_fp8_mqa_logits_cuda(
+        q, buf, w, lens, bt, 1024, force_row_kernel=True
+    )
     out_auto = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, 1024)
-    out_tiled = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, 1024, force_tiled_kernel=True)
+    out_tiled = paged_fp8_mqa_logits_cuda(
+        q, buf, w, lens, bt, 1024, force_tiled_kernel=True
+    )
     for m in range(M):
         c = int(lens[m, 0])
         assert torch.equal(out_auto[m, :c], out_row[m, :c]), (m, c)

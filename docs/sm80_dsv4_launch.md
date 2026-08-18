@@ -147,3 +147,22 @@ Micro-bench M=8192 (kernel-side, c4 ctx 2048/6144/24576): **13.5/37.5/131.5 ms
 → 5.4/16.0/63.7 ms (2.1-2.5x)**. E2E @~100k prompt: per-chunk input tok/s
 3516→3920 (8k ctx), 2094→2657 (49k), 1582→2115 (81k, +34%); **TTFT 40.5 s →
 35.6-38.3 s cold**. Decode unchanged: 53.2 tok/s @98k steady.
+
+### Prefill: sparse-MLA head-tile fusion, BLOCK_H=32 (2026-08-19)
+
+The sparse MLA prefill kernel ran one CTA per (token, 16-head tile) — with
+64 replicated heads/rank that is 4 CTAs per token each re-gathering and
+re-dequantizing the SAME KV rows. `BLOCK_H=32` fuses two head-tiles per CTA
+(halving the redundant gather+decode work): c4-layer kernel 45.6→31.9 ms
+(with `BLOCK_N=32` for ≤640-row lists), c128@94k 61.9→40.7 ms
+(`BLOCK_N=64`). Enabled for `T ≥ 32` with `H % 32 == 0`; decode (`T ≤ 8`)
+keeps `BLOCK_H=16` — measured faster there (215 vs 277 µs/call). A split-K
+variant over the flattened per-token index lists (explicit `num_splits=`)
+is implemented and tested but measured NEVER faster on A100 at prefill T
+(partial write+read traffic dominates), so it stays auto-disabled below
+4096 rows/token. Micro-bench + trail: `.superpowers/sdd/task-10-report.md`.
+
+E2E @~100k prompt (2 runs): chunk@8k ctx **5039 tok/s** (was 3920),
+@49k **3266** (was 2657), deepest@81k **2590** (was 2115); vs the original
+pre-optimization baseline +43/+56/+64%. **TTFT 40.5 s → 28.5-28.6 s**.
+Decode @98k: 52.5 tok/s steady (gate ≥50 PASS, unchanged).
