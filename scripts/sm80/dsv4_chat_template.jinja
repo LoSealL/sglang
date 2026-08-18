@@ -1,0 +1,20 @@
+{#- DeepSeek-V4-Flash chat template (thinking mode), ported from the official
+    encode_messages reference (vllm/tokenizers/deepseek_v4_encoding.py):
+    bos + reasoning-effort preamble + [system content] +
+    <｜User｜>... / <｜Assistant｜>...<eos> turns + <｜Assistant｜><think>.
+    History assistant reasoning is dropped (drop_thinking=True default).
+    Tools/DSML tool-calls are not encoded by this minimal template. -#}
+{{- "<｜begin▁of▁sentence｜>" -}}
+{{- "Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n" -}}
+{%- for message in messages -%}
+  {%- if message["role"] == "system" -%}
+    {{- message["content"] -}}
+  {%- elif message["role"] == "user" -%}
+    {{- "<｜User｜>" + message["content"] -}}
+  {%- elif message["role"] == "assistant" -%}
+    {{- "<｜Assistant｜></think>" + message["content"] + "<｜end▁of▁sentence｜>" -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {{- "<｜Assistant｜><think>" -}}
+{%- endif -%}

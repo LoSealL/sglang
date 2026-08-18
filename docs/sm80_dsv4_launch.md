@@ -18,11 +18,24 @@ MODEL=/nvme2data/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/7872f
   --moe-runner-backend marlin \
   --context-length 102400 --port 8000 --host 0.0.0.0 \
   --mem-fraction-static 0.5 \
+  --chat-template scripts/sm80/dsv4_chat_template.jinja \
   --reasoning-parser deepseek-v4 --tool-call-parser deepseekv4 \
   > /tmp/opencode/sgl_server.log 2>&1 &
 ```
 
 No environment variables required. Notes:
+
+- **CoT requires thinking mode, not just the template flag.** The checkpoint ships no
+  chat_template; `scripts/sm80/dsv4_chat_template.jinja` reproduces the official
+  thinking-mode encoder frame for the raw-completions path. But with
+  `--tool-call-parser deepseekv4`, `/v1/chat/completions` uses sglang's native DSV4
+  encoder and does not consult `--chat-template`; thinking defaults to OFF (frame ends
+  `</think>`), so responses have empty `reasoning_content`. To get CoT, send
+  `"chat_template_kwargs": {"thinking": true}` per request (or launch with
+  `SGLANG_DEFAULT_THINKING=1`). Verified 2026-08-18: math/Paris/multi-turn-haiku probes
+  all return structured `reasoning_content` + correct `content`, no `<think>` leakage.
+  Budget `max_tokens` for the reasoning tokens (a 512 cap can be consumed by thinking
+  alone). Evidence: `.superpowers/sdd/task-10-report.md`.
 
 - `--moe-runner-backend marlin` is **required on sm80**: DSV4-Flash experts are
   FP4-packed (`expert_dtype: fp4`) and the default auto→Triton runner cannot touch
@@ -82,6 +95,13 @@ within `--context-length 102400`, exceeding the vLLM sm80 reference (which fails
 
 100k perf (98k-token prompt, cache flushed): TTFT 40.5 s; decode 13.3 tok/s at 98k
 context (server-side gen throughput, cuda graphs on).
+
+Streaming decode @98k (2026-08-18, chat API, thinking on, idle GPUs): steady-state
+**13.2–13.4 tok/s** across cold, radix-cached, and long-output runs (server log:
+13.39–13.42 tok/s). TTFT 40.1 s cold vs **0.44 s** on an identical-prefix rerun
+(radix cache). The user-reported "~1 tps" is TTFT amortization over a short output:
+58 completion tokens / 44.5 s wall = 1.30 tok/s. Same request cached: 12.0 tok/s
+amortized. No decode regression; prefix reuse dominates perceived speed.
 
 Earlier pre-fix numbers (kept for the record): onset of retrieval loss at 16384 with
 coherent-denial failures, degenerate decode at 100k — fully explained by the layout
