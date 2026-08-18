@@ -65,13 +65,83 @@ def _f32_to_e4m3_bits(x):
 
 
 @triton.jit
-def _mqa_logits_inner(q_bf16, kv_bf16, kv_scales, w, BLOCK_KV: tl.constexpr):
+def _halve(x, N: tl.constexpr, BKV: tl.constexpr):
+    # x [N, BKV] -> [N//2, BKV]: fixed pairwise tree (row h + row h + N//2).
+    # tl.sum's reduction order is layout-chosen, which breaks bitwise equality
+    # between the per-row and BLOCK_M-tiled kernels; this tree is identical in
+    # any kernel/warp-count context. Kernels launch with enable_fp_fusion=False
+    # so the adds stay pure (no mul+add FMA contraction).
+    y = tl.reshape(x, (2, N // 2, BKV))
+    y = tl.permute(y, (1, 2, 0))
+    u, v = tl.split(y)
+    return u + v
+
+
+@triton.jit
+def _sum_h(x, H_PAD: tl.constexpr, BKV: tl.constexpr):
+    if H_PAD > 64:
+        x = _halve(x, H_PAD, BKV)
+    if H_PAD > 32:
+        x = _halve(x, 64, BKV)
+    if H_PAD > 16:
+        x = _halve(x, 32, BKV)
+    if H_PAD > 8:
+        x = _halve(x, 16, BKV)
+    if H_PAD > 4:
+        x = _halve(x, 8, BKV)
+    if H_PAD > 2:
+        x = _halve(x, 4, BKV)
+    if H_PAD > 1:
+        x = _halve(x, 2, BKV)
+    return tl.reshape(x, (BKV,))
+
+
+@triton.jit
+def _mqa_logits_inner(
+    q_bf16,
+    kv_bf16,
+    kv_scales,
+    w,
+    NUM_HEADS_PADDED: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+):
     # q_bf16 [H_PAD, D]; kv_bf16 [D, BLOCK_KV]; kv_scales [BLOCK_KV]; w [H_PAD]
     scores = tl.dot(q_bf16, kv_bf16)  # [H_PAD, BLOCK_KV] fp32
     scores = scores * kv_scales[None, :]
     scores = tl.maximum(scores, 0.0)
     scores = scores * w[:, None]
-    return tl.sum(scores, 0)  # [BLOCK_KV]
+    return _sum_h(scores, NUM_HEADS_PADDED, BLOCK_KV)  # [BLOCK_KV]
+
+
+@triton.jit
+def _halve_mid(x, B: tl.constexpr, N: tl.constexpr, BKV: tl.constexpr):
+    # x [B, N, BKV] -> [B, N//2, BKV]: same pairwise order as _halve (row
+    # n + row n + N//2 on the head axis), batched over B query rows.
+    y = tl.reshape(x, (B, 2, N // 2, BKV))
+    y = tl.permute(y, (0, 2, 3, 1))
+    u, v = tl.split(y)
+    return u + v
+
+
+@triton.jit
+def _sum_h3(x, B: tl.constexpr, H_PAD: tl.constexpr, BKV: tl.constexpr):
+    # x [B, H_PAD, BKV] -> [B, BKV]; batched _sum_h (identical pairing order,
+    # so the tiled kernel stays bitwise-equal to the per-row kernel).
+    if H_PAD > 64:
+        x = _halve_mid(x, B, H_PAD, BKV)
+    if H_PAD > 32:
+        x = _halve_mid(x, B, 64, BKV)
+    if H_PAD > 16:
+        x = _halve_mid(x, B, 32, BKV)
+    if H_PAD > 8:
+        x = _halve_mid(x, B, 16, BKV)
+    if H_PAD > 4:
+        x = _halve_mid(x, B, 8, BKV)
+    if H_PAD > 2:
+        x = _halve_mid(x, B, 4, BKV)
+    if H_PAD > 1:
+        x = _halve_mid(x, B, 2, BKV)
+    return tl.reshape(x, (B, BKV))
 
 
 @triton.jit
@@ -125,7 +195,7 @@ def _fp8_mqa_logits_cuda_kernel(
             )
         ).to(tl.bfloat16)
         sc = tl.load(scale_ptrs, mask=mask, other=0.0)
-        scores = _mqa_logits_inner(q, kv, sc, w, BLOCK_KV)
+        scores = _mqa_logits_inner(q, kv, sc, w, NUM_HEADS_PADDED, BLOCK_KV)
         tl.store(out_ptrs, scores, mask=mask)
         kv_ptrs += BLOCK_KV * stride_kv_n
         scale_ptrs += BLOCK_KV * stride_scale_n
@@ -177,6 +247,7 @@ def fp8_mqa_logits_cuda(q, k_fp8, kv_scales, weights, cu_starts, cu_ends):
         stride_kv_d=k_fp8.stride(1),
         stride_scale_n=kv_scales_1d.stride(0),
         num_warps=4,
+        enable_fp_fusion=False,
     )
     return logits
 
@@ -253,8 +324,174 @@ def _paged_fp8_mqa_logits_cuda_kernel(
                 mask=mask,
                 other=0.0,
             )
-            scores = _mqa_logits_inner(q, kv, sc, w, BLOCK_KV)
+            scores = _mqa_logits_inner(q, kv, sc, w, NUM_HEADS_PADDED, BLOCK_KV)
             tl.store(Logits_ptr + row * stride_logits_m + offs_n, scores, mask=mask)
+
+
+@triton.jit
+def _paged_fp8_mqa_logits_tiled_kernel(
+    Q_ptr,
+    Cache_ptr,
+    W_ptr,
+    Ctx_ptr,
+    BlockTable_ptr,
+    Logits_ptr,
+    M,
+    next_n,
+    b_max,
+    split_kv,
+    NUM_HEADS: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    NUM_HEADS_PADDED: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_KV: tl.constexpr,
+    block_size: tl.constexpr,
+    stride_q_m,
+    stride_w_m,
+    stride_logits_m,
+    stride_bt_b,
+    stride_cache_b,
+):
+    # Prefill variant of the kernel above: one CTA covers BLOCK_M query rows,
+    # so each 64-row KV block is software-decoded once and the logits run as
+    # one [BLOCK_M * H_PAD, D] x [D, BLOCK_KV] tensor-core GEMM per KV block
+    # (the per-row kernel's [H_PAD, D] dot wastes ~90% of TC throughput and
+    # re-decodes the same KV bytes per query row). BLOCK_KV == block_size and
+    # split_kv % block_size == 0 (asserted in the wrapper) keep every KV step
+    # inside one page, so the page id is the scalar start_n // block_size.
+    # Per-row ctxs differ inside a tile: the loop bound is the tile max and
+    # each row stores only its own [0, end) columns.
+    pid_m = tl.program_id(0)
+    split = tl.program_id(1)
+    start = split * split_kv
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = offs_m < M
+    offs_m_c = tl.minimum(offs_m, M - 1)
+    offs_n = tl.arange(0, BLOCK_KV)
+    # flattened (row, head) index for the big dot
+    offs_mh = tl.arange(0, BLOCK_M * NUM_HEADS_PADDED)
+    mh_row = pid_m * BLOCK_M + offs_mh // NUM_HEADS_PADDED
+    mh_h = offs_mh % NUM_HEADS_PADDED
+    mh_mask = (mh_row < M) & (mh_h < NUM_HEADS)
+    mh_row_c = tl.minimum(mh_row, M - 1)
+    offs_d = tl.arange(0, HEAD_SIZE)
+
+    ctx_vec = tl.load(Ctx_ptr + offs_m, mask=m_mask, other=0)
+    end_vec = tl.minimum(start + split_kv, ctx_vec)
+    block_end = tl.max(end_vec, 0)
+    if start < block_end:
+        b_vec = tl.minimum(offs_m // next_n, b_max)
+        # q/w are loaded once per CTA and held in registers across the KV
+        # loop (in-loop reloads of the strided (m, h)-flattened tile measure
+        # 20-40x slower; fp8-byte-held + per-block re-decode makes the
+        # compiler spill the whole tile).
+        q2d = _fp8e4m3_to_f32(
+            tl.load(
+                Q_ptr
+                + mh_row_c[:, None] * stride_q_m
+                + mh_h[:, None] * HEAD_SIZE
+                + offs_d[None, :],
+                mask=mh_mask[:, None],
+                other=0,
+            )
+        ).to(tl.bfloat16)
+        w2d = tl.load(W_ptr + mh_row_c * stride_w_m + mh_h, mask=mh_mask, other=0.0)
+        for start_n in tl.range(start, block_end, BLOCK_KV):
+            col = start_n // block_size
+            pids = tl.load(BlockTable_ptr + b_vec * stride_bt_b + col)
+            act = end_vec > start_n
+            lo = tl.min(tl.where(act, pids, 2147483647), 0)
+            hi = tl.max(tl.where(act, pids, -2147483648), 0)
+            if lo == hi:
+                # All active rows read this KV block from the same page
+                # (request-keyed block tables): decode once, one big GEMM
+                # for the whole tile. q/w live in registers across the KV
+                # loop (BLOCK_M * H_PAD * 2B; BLOCK_M is bounded to keep
+                # this under the register budget).
+                base = lo * stride_cache_b
+                kv = _fp8e4m3_to_f32(
+                    tl.load(
+                        Cache_ptr
+                        + base
+                        + offs_n[None, :] * HEAD_SIZE
+                        + offs_d[:, None],
+                        mask=offs_n[None, :] < block_end,
+                        other=0,
+                    )
+                ).to(tl.bfloat16)
+                sc = tl.load(
+                    Cache_ptr.to(tl.pointer_type(tl.float32))
+                    + (base + block_size * HEAD_SIZE + offs_n * 4) // 4,
+                    mask=offs_n < block_end,
+                    other=0.0,
+                )
+                scores = tl.dot(q2d, kv)  # [BLOCK_M * H_PAD, BLOCK_KV] fp32
+                scores = scores * sc[None, :]
+                scores = tl.maximum(scores, 0.0)
+                scores = scores * w2d[:, None]
+                out = _sum_h3(
+                    tl.reshape(scores, (BLOCK_M, NUM_HEADS_PADDED, BLOCK_KV)),
+                    BLOCK_M,
+                    NUM_HEADS_PADDED,
+                    BLOCK_KV,
+                )  # [BLOCK_M, BLOCK_KV]
+                tl.store(
+                    Logits_ptr
+                    + offs_m_c[:, None] * stride_logits_m
+                    + start_n
+                    + offs_n[None, :],
+                    out,
+                    mask=(offs_n[None, :] < end_vec[:, None]) & m_mask[:, None],
+                )
+            else:
+                # Request boundary inside the tile: rows disagree on the page,
+                # fall back to per-row fetches (bitwise-equal, just slower).
+                offs_h = tl.arange(0, NUM_HEADS_PADDED)
+                h_mask = offs_h < NUM_HEADS
+                for i in tl.range(0, BLOCK_M):
+                    row_raw = pid_m * BLOCK_M + i
+                    row = tl.minimum(row_raw, M - 1)
+                    b_i = tl.minimum(row // next_n, b_max)
+                    pid_i = tl.load(BlockTable_ptr + b_i * stride_bt_b + col)
+                    base = pid_i * stride_cache_b
+                    e = tl.minimum(start + split_kv, tl.load(Ctx_ptr + row))
+                    e = tl.where(row_raw < M, e, 0)
+                    mask_i = offs_n < e
+                    kv = _fp8e4m3_to_f32(
+                        tl.load(
+                            Cache_ptr
+                            + base
+                            + offs_n[None, :] * HEAD_SIZE
+                            + offs_d[:, None],
+                            mask=mask_i[None, :],
+                            other=0,
+                        )
+                    ).to(tl.bfloat16)
+                    sc = tl.load(
+                        Cache_ptr.to(tl.pointer_type(tl.float32))
+                        + (base + block_size * HEAD_SIZE + offs_n * 4) // 4,
+                        mask=mask_i,
+                        other=0.0,
+                    )
+                    q = _fp8e4m3_to_f32(
+                        tl.load(
+                            Q_ptr
+                            + row * stride_q_m
+                            + offs_h[:, None] * HEAD_SIZE
+                            + offs_d[None, :],
+                            mask=h_mask[:, None],
+                            other=0,
+                        )
+                    ).to(tl.bfloat16)
+                    w = tl.load(
+                        W_ptr + row * stride_w_m + offs_h, mask=h_mask, other=0.0
+                    )
+                    scores = _mqa_logits_inner(q, kv, sc, w, NUM_HEADS_PADDED, BLOCK_KV)
+                    tl.store(
+                        Logits_ptr + row * stride_logits_m + start_n + offs_n,
+                        scores,
+                        mask=mask_i,
+                    )
 
 
 # KV rows per CTA (grid axis 1 = ceil(max_len / _SPLIT_KV)); each CTA writes a
@@ -263,6 +500,17 @@ def _paged_fp8_mqa_logits_cuda_kernel(
 # 512: 0.116/0.117 ms; 1024: 0.179/0.180 ms): bs=1 decode needs ~200 CTAs to
 # fill 108 SMs; the kernel is per-CTA-overhead bound, so more/smaller splits win.
 _SPLIT_KV = 128
+
+# Prefill tiles: M >= this routes to the BLOCK_M-tiled kernel (decode sizes
+# keep the tuned per-row kernel). Tuned on idle A100-80GB at M=8192
+# (c4 ctx 2k/6k/24.5k -> 5.4/16.0/63.7 ms vs the per-row kernel's
+# 13.5/37.5/131.5 ms, ~2.1-2.6x): BM=4/nw=8/split=4096 compiles spill-free
+# (250 regs); BM=2/nw=4 is 4% faster but spills (246 slots), so the robust
+# config wins. The tiled split is far larger than decode's 128: each CTA's
+# held q tile amortizes over many KV blocks.
+_TILED_MIN_M = 32
+_TILE_M = 4
+_SPLIT_KV_TILED = 4096
 
 
 def paged_fp8_mqa_logits_cuda(
@@ -274,6 +522,8 @@ def paged_fp8_mqa_logits_cuda(
     max_len,
     block_size=64,
     split_kv=None,
+    force_row_kernel=False,
+    force_tiled_kernel=False,
 ):
     """Paged fp8 MQA logits (decode call site).
 
@@ -296,7 +546,10 @@ def paged_fp8_mqa_logits_cuda(
             a ``tensor.max()`` host sync per call.
         block_size: Rows per cache page (indexer pool: 64).
         split_kv: KV rows per CTA along grid axis 1 (default: tuned
-            ``_SPLIT_KV``). Splits beyond a row's ctx exit immediately.
+            ``_SPLIT_KV``, ``_SPLIT_KV_TILED`` for the tiled prefill path).
+            Splits beyond a row's ctx exit immediately.
+        force_row_kernel / force_tiled_kernel: test hooks to pin the kernel
+            choice regardless of the ``M`` selector.
 
     Returns:
         Logits ``[B * next_n, max_len]`` float32. Only ``[0, ctx)`` per row
@@ -311,8 +564,7 @@ def paged_fp8_mqa_logits_cuda(
     assert head_size >= 16 and head_size & (head_size - 1) == 0
     assert kv_cache.stride(1) == 1
     assert kv_cache.shape[1] == block_size * (head_size + 4), (
-        "raw block-layout pool buffer expected: "
-        "[num_blocks, block_size * (D + 4)]"
+        "raw block-layout pool buffer expected: [num_blocks, block_size * (D + 4)]"
     )
     assert kv_cache.stride(0) % 4 == 0 and kv_cache.data_ptr() % 4 == 0, (
         "fp32 scale load needs 4B alignment"
@@ -322,8 +574,43 @@ def paged_fp8_mqa_logits_cuda(
     assert weights.stride(1) == 1 and block_tables.stride(1) == 1
     ctx_flat = context_lens.reshape(-1)
     logits = torch.empty((B * next_n, max_len), dtype=torch.float32, device=q.device)
+    M = B * next_n
+    tiled = (M >= _TILED_MIN_M or force_tiled_kernel) and not force_row_kernel
     if split_kv is None:
-        split_kv = _SPLIT_KV
+        split_kv = _SPLIT_KV_TILED if tiled else _SPLIT_KV
+    if tiled:
+        assert split_kv % block_size == 0 and block_size & (block_size - 1) == 0, (
+            "tiled kernel needs one KV step per page (split_kv multiple of a"
+            " power-of-two block_size)"
+        )
+        splits = (max_len + split_kv - 1) // split_kv
+        _paged_fp8_mqa_logits_tiled_kernel[(triton.cdiv(M, _TILE_M), splits)](
+            q_flat.view(torch.uint8),
+            kv_cache,
+            weights,
+            ctx_flat,
+            block_tables,
+            logits,
+            M,
+            next_n,
+            B - 1,
+            split_kv,
+            NUM_HEADS=num_heads,
+            HEAD_SIZE=head_size,
+            NUM_HEADS_PADDED=triton.next_power_of_2(max(num_heads, 16)),
+            BLOCK_M=_TILE_M,
+            BLOCK_KV=block_size,
+            block_size=block_size,
+            stride_q_m=q_flat.stride(0),
+            stride_w_m=weights.stride(0),
+            stride_logits_m=logits.stride(0),
+            stride_bt_b=block_tables.stride(0),
+            stride_cache_b=kv_cache.stride(0),
+            num_warps=8,
+            num_stages=3,
+            enable_fp_fusion=False,
+        )
+        return logits
     splits = (max_len + split_kv - 1) // split_kv
     _paged_fp8_mqa_logits_cuda_kernel[(B * next_n, splits)](
         q_flat.view(torch.uint8),
@@ -346,6 +633,7 @@ def paged_fp8_mqa_logits_cuda(
         stride_bt_b=block_tables.stride(0),
         stride_cache_b=kv_cache.stride(0),
         num_warps=4,
+        enable_fp_fusion=False,
     )
     return logits
 

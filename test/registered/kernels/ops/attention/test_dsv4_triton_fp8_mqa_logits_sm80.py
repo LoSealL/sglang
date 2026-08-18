@@ -226,6 +226,62 @@ def test_paged_splitkv_parallel():
     assert sorted(times)[25] < 1.5, f"kernel too slow: {sorted(times)[25]:.3f} ms"
 
 
+def test_paged_tiled_matches_perrow():
+    """BLOCK_M-tiled prefill kernel must be bitwise-identical to the tuned
+    per-row kernel on every written [0, ctx) prefix: mixed per-row ctxs inside
+    a tile (loop bound = tile max, per-row store masks), uneven tile tails
+    (rows past M), and tiles whose rows map to different block-table rows
+    (request boundary -> non-uniform page ids)."""
+    torch.manual_seed(0)
+    block = 64
+    for ctx_hi, pages_per_row in ((1000, 16), (5000, 80)):
+        M = 203  # 25 full BLOCK_M=8 tiles + a 3-row tail
+        buf = _block_layout_pool(M * pages_per_row, block)
+        bt = (
+            torch.arange(pages_per_row, device="cuda", dtype=torch.int32)[None, :]
+            .expand(M, -1)
+            .contiguous()
+        )
+        bt[100:150] += 512  # second "request": own pages, tiles straddle at 96/104
+        specials = [1, 7, 63, 64, 65, 127, 128, 129, 255, 256, 257, ctx_hi]
+        ctxs = [specials[i % len(specials)] for i in range(M)]
+        lens = torch.tensor([[c] for c in ctxs], device="cuda", dtype=torch.int32)
+        q = (torch.randn(M, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+        w = torch.randn(M, H, device="cuda")
+        max_len = pages_per_row * block
+
+        out_row = paged_fp8_mqa_logits_cuda(
+            q, buf, w, lens, bt, max_len, force_row_kernel=True
+        )
+        out_tiled = paged_fp8_mqa_logits_cuda(
+            q, buf, w, lens, bt, max_len, force_tiled_kernel=True
+        )
+        out_auto = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len)
+        for m, c in enumerate(ctxs):
+            assert torch.equal(out_auto[m, :c], out_tiled[m, :c]), (ctx_hi, m, c)
+            assert torch.equal(out_tiled[m, :c], out_row[m, :c]), (ctx_hi, m, c)
+
+    # Small M: selector keeps the per-row kernel; forced tiled still matches
+    # (partial tile with rows past M).
+    M = 5
+    buf = _block_layout_pool(M * 16, block)
+    bt = (
+        torch.arange(16, device="cuda", dtype=torch.int32)[None, :]
+        .expand(M, -1)
+        .contiguous()
+    )
+    lens = torch.tensor([[5], [64], [65], [1], [1000]], device="cuda", dtype=torch.int32)
+    q = (torch.randn(M, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+    w = torch.randn(M, H, device="cuda")
+    out_row = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, 1024, force_row_kernel=True)
+    out_auto = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, 1024)
+    out_tiled = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, 1024, force_tiled_kernel=True)
+    for m in range(M):
+        c = int(lens[m, 0])
+        assert torch.equal(out_auto[m, :c], out_row[m, :c]), (m, c)
+        assert torch.equal(out_tiled[m, :c], out_row[m, :c]), (m, c)
+
+
 def test_sm80_metadata_gating_and_kernel_importable(monkeypatch):
     """sm80: Triton adapter is the dispatch target; metadata avoids deep_gemm/topk_v2."""
     from sglang.srt.layers.attention.dsv4 import indexer as indexer_mod
