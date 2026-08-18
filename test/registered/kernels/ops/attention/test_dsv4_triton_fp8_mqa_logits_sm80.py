@@ -45,52 +45,105 @@ def test_paged_garbage_tail():
     B, block, pages, ctx = 5, 64, 9, 400
     q = (torch.randn(B, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
     # Byte 0x7F is NaN in e4m3fn; garbage values must stay finite for the ref
-    # decode, garbage scales sane so magnitudes stay comparable.
-    kv = torch.randint(0, 254, (pages, block, D + 4), dtype=torch.uint8, device="cuda")
-    kv[kv == 127] = 126
-    kv[..., D:] = (torch.rand(pages, block, 1, device="cuda") + 0.5).view(torch.uint8)
+    # decode, garbage scales sane so magnitudes stay comparable. Block layout
+    # per page: [block x D value bytes | block x 4B fp32 scales].
+    buf = torch.randint(0, 254, (pages, block * (D + 4)), dtype=torch.uint8, device="cuda")
+    buf[buf == 127] = 126
+    buf[:, block * D :] = (torch.rand(pages, block, device="cuda") + 0.5).view(torch.uint8)
     w = torch.randn(B, H, device="cuda")
     lens = torch.tensor([[ctx], [7], [64], [65], [399]], device="cuda", dtype=torch.int32)
     bt = torch.randint(0, pages, (B, 16), device="cuda", dtype=torch.int32)
-    out = paged_fp8_mqa_logits_cuda(q, kv, w, lens, bt, max_len=512)
+    out = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len=512)
     assert out.shape == (B, 512)
     # decode against a torch decode of the same u8 cache for row 0
-    u8 = kv.view(-1)
+    u8 = buf.view(-1)
+    page_bytes = block * (D + 4)
+
     def dec_row(b, n):
-        blk = bt[b, n // block].item()
-        off = (blk * block + n % block) * (D + 4)
-        vals = u8[off : off + D].view(torch.float8_e4m3fn).float()
-        scale = u8[off + D : off + D + 4].view(torch.float32).float().item()
-        return vals * scale
+        base = bt[b, n // block].item() * page_bytes
+        vals = u8[base + (n % block) * D : base + (n % block) * D + D]
+        scale = u8[base + block * D + (n % block) * 4 : base + block * D + (n % block) * 4 + 4]
+        return vals.view(torch.float8_e4m3fn).float() * scale.view(torch.float32).float().item()
+
     k0 = torch.stack([dec_row(0, n) for n in range(ctx)])
     ref0 = (torch.relu(q[0, 0].float() @ k0.T) * w[0][:, None]).sum(0)
     torch.testing.assert_close(out[0, :ctx], ref0, atol=0.5, rtol=0.05)
 
 
 def test_adapter_sglang_paged_mqa_logits():
-    """DeepGEMM-signature adapter: same pool, same kernel → bitwise-equal logits."""
+    """DeepGEMM-signature adapter: same raw pool buffer, same kernel → bitwise-equal logits."""
     torch.manual_seed(0)
     B, block, pages = 5, 64, 9
     q = (torch.randn(B, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
-    # Pool laid out like indexer.py: flat [pages, 64*132], viewed [pages, 64, 1, 132].
+    # Pool buffer like get_index_k_with_scale_buffer: raw [pages, 64*(D+4)]
+    # uint8 in sglang block layout (values block, then scales block, per page).
     buf = torch.randint(0, 254, (pages, block * (D + 4)), dtype=torch.uint8, device="cuda")
     buf[buf == 127] = 126
-    buf.view(pages, block, D + 4)[..., D:] = (
-        torch.rand(pages, block, 1, device="cuda") + 0.5
-    ).view(torch.uint8)
+    buf[:, block * D :] = (torch.rand(pages, block, device="cuda") + 0.5).view(torch.uint8)
     w = torch.randn(B, H, device="cuda")
     lens = torch.tensor([[400], [7], [64], [65], [399]], device="cuda", dtype=torch.int32)
     bt = torch.randint(0, pages, (B, 16), device="cuda", dtype=torch.int32)
-    out = sglang_paged_mqa_logits(
-        q, buf.view(pages, block, 1, D + 4), w, lens, bt, None, 512
-    )
+    out = sglang_paged_mqa_logits(q, buf, w, lens, bt, None, 512)
     assert out.shape == (B, 512) and out.dtype == torch.float32
-    ref = paged_fp8_mqa_logits_cuda(
-        q, buf.view(pages, block, D + 4), w, lens, bt, max_len=512
-    )
+    ref = paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len=512)
     # Tail beyond ctx is undefined (torch.empty); written prefix must be exact.
     for m in range(B):
         assert torch.equal(out[m, : int(lens[m, 0])], ref[m, : int(lens[m, 0])])
+
+
+def test_paged_sglang_block_layout():
+    """Kernel must read sglang's BLOCK-layout indexer cache (store.cuh): each
+    64-row page = [64 x 128 fp8 value rows | 64 x 4B fp32 scales] (8448B), NOT
+    vLLM-style interleaved 132B rows. NaN scales just past each ctx boundary
+    must not leak into [0, ctx)."""
+    torch.manual_seed(0)
+    B, block, pages = 5, 64, 40
+    ctxs = [1, 63, 64, 65, 400]
+
+    # fp8-quantize random rows with per-row scales, written in block layout
+    x = torch.randn(pages, block, D, device="cuda")
+    sc = (x.abs().amax(-1) / 448).clamp(min=1e-4)
+    vals = (x / sc[..., None]).to(torch.float8_e4m3fn)
+    buf = torch.zeros(pages, block * (D + 4), dtype=torch.uint8, device="cuda")
+    buf[:, : block * D] = vals.view(torch.uint8).reshape(pages, -1)
+    buf[:, block * D :] = sc.contiguous().view(torch.uint8).reshape(pages, -1)
+
+    # Per-row dedicated page ranges; NaN fp32 scales just past each ctx.
+    bt = (
+        torch.arange(B, device="cuda", dtype=torch.int32)[:, None] * 8
+        + torch.arange(8, device="cuda", dtype=torch.int32)[None, :]
+    )
+    nan = torch.tensor([0x00, 0x00, 0xC0, 0x7F], dtype=torch.uint8, device="cuda")
+    for b, ctx in enumerate(ctxs):
+        for off in (ctx, ctx + 1):
+            page = bt[b, off // block].item()
+            s0 = block * D + (off % block) * 4
+            buf[page, s0 : s0 + 4] = nan
+
+    # The DeepGEMM-style [pages, 64, 1, 132] view is nominal-shape only: its
+    # implied 132B value rows (stride(1)==132) do not match the real 128B rows.
+    assert buf.view(pages, block, 1, D + 4).squeeze(2).stride(1) == D + 4 != D
+
+    q = (torch.randn(B, 1, H, D, device="cuda") * 0.3).to(torch.float8_e4m3fn)
+    w = torch.randn(B, H, device="cuda")
+    lens = torch.tensor([[c] for c in ctxs], device="cuda", dtype=torch.int32)
+
+    vals_dec = buf[:, : block * D].reshape(pages, block, D).view(torch.float8_e4m3fn).float()
+    sc_dec = buf[:, block * D :].view(torch.float32)
+    outs = [
+        paged_fp8_mqa_logits_cuda(q, buf, w, lens, bt, max_len=512),
+        sglang_paged_mqa_logits(q, buf, w, lens, bt, None, 512),
+    ]
+    for out in outs:
+        for b, ctx in enumerate(ctxs):
+            n = torch.arange(ctx, device="cuda")
+            k = vals_dec[bt[b, n // block], n % block]
+            s = sc_dec[bt[b, n // block], n % block]
+            # kernel decodes fp8 -> bf16 before the dot; mirror that in the ref
+            qf = q[b, 0].float().to(torch.bfloat16).float()
+            kb = k.to(torch.bfloat16).float()
+            ref = (torch.relu(torch.einsum("hd,nd->hn", qf, kb)) * s * w[b][:, None]).sum(0)
+            torch.testing.assert_close(out[b, :ctx], ref, rtol=2e-3, atol=2e-3)
 
 
 def test_sm80_metadata_gating_and_kernel_importable(monkeypatch):

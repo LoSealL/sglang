@@ -708,6 +708,7 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        sm80_triton_logits = False
         if use_fp4_indexer:
             weights = weights.float()
             if is_sm80_supported():
@@ -733,6 +734,10 @@ class C4IndexerBackendMixin:
             from sglang.kernels.ops.attention.dsv4.triton_fp8_mqa_logits_cuda import (
                 sglang_paged_mqa_logits as fn,
             )
+
+            # The adapter reads the raw block-layout pool buffer directly; the
+            # [., 64, 1, 132] view below is the DeepGEMM nominal shape only.
+            sm80_triton_logits = True
         elif is_xpu():
             from sgl_kernel import fp8_paged_mqa_logits_triton
 
@@ -786,10 +791,11 @@ class C4IndexerBackendMixin:
                 layer_id=c4_indexer.layer_id,
             )
             assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
-            )
+            if not sm80_triton_logits:
+                head_dim_with_sf = 68 if use_fp4_indexer else 132
+                c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                    c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
+                )
             logits = fn(
                 q,
                 c4_indexer_kv_cache,

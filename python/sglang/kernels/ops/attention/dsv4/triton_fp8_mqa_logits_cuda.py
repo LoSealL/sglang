@@ -200,8 +200,7 @@ def _paged_fp8_mqa_logits_cuda_kernel(
     stride_w_m,
     stride_logits_m,
     stride_bt_b,
-    stride_cache_b,  # bytes per block row (may include inter-block padding)
-    stride_cache_n,  # bytes per token row within a block
+    stride_cache_b,  # bytes per page: block layout [block_size*HEAD_SIZE values | block_size*4 scales]
 ):
     row = tl.program_id(0)
     b = row // next_n
@@ -226,7 +225,11 @@ def _paged_fp8_mqa_logits_cuda_kernel(
             mask=mask,
             other=0,
         ).to(tl.int64)
-        row_bytes = blocks * stride_cache_b + (offs_n % block_size) * stride_cache_n
+        page_off = offs_n % block_size
+        # sglang block layout (kernels/jit .../store.cuh fused_store_cache):
+        # value row at page + off*HEAD_SIZE, scale at
+        # page + block_size*HEAD_SIZE + off*4. All offsets 4B-aligned.
+        row_bytes = blocks * stride_cache_b + page_off * HEAD_SIZE
         kv = _fp8e4m3_to_f32(
             tl.load(
                 Cache_ptr + row_bytes[None, :] + offs_d[:, None],
@@ -234,7 +237,7 @@ def _paged_fp8_mqa_logits_cuda_kernel(
                 other=0,
             )
         ).to(tl.bfloat16)
-        scale_bytes = row_bytes + HEAD_SIZE
+        scale_bytes = blocks * stride_cache_b + block_size * HEAD_SIZE + page_off * 4
         sc = tl.load(
             Cache_ptr.to(tl.pointer_type(tl.float32)) + scale_bytes // 4,
             mask=mask,
@@ -245,20 +248,28 @@ def _paged_fp8_mqa_logits_cuda_kernel(
 
 
 def paged_fp8_mqa_logits_cuda(
-    q, kv_cache, weights, context_lens, block_tables, max_len
+    q, kv_cache, weights, context_lens, block_tables, max_len, block_size=64
 ):
     """Paged fp8 MQA logits (decode call site).
 
     Args:
         q: Queries ``[B, next_n, H, D]`` fp8e4m3 (``next_n == 1`` only).
-        kv_cache: ``[num_blocks, block_size, D + 4]`` uint8; per token, ``D``
-            fp8 value bytes followed by a float32 scale (little-endian).
-            Must be contiguous and 4-byte aligned (asserted).
+        kv_cache: Raw per-layer indexer pool buffer ``[num_blocks,
+            block_size * (D + 4)]`` uint8 in sglang's block layout (the
+            writer is ``kernels/jit/csrc/deepseek_v4/store.cuh``
+            ``fused_store_cache(type="indexer")``): each page is
+            ``[block_size x D fp8 value rows][block_size x 4B fp32 scales]``
+            — value at ``page + off * D``, scale at
+            ``page + block_size * D + off * 4``. This is NOT vLLM's
+            interleaved ``D + 4``-byte row layout. Must be 4-byte aligned
+            (asserted).
         weights: Per-head weights ``[B * next_n, H]`` float32.
         context_lens: Context lengths ``[B, next_n]`` int32.
-        block_tables: Block ids ``[B, max_blocks]`` int32.
+        block_tables: Block ids ``[B, max_blocks]`` int32 (row granularity
+            ``block_size``).
         max_len: Static row width for the output (``max_model_len``); avoids
             a ``tensor.max()`` host sync per call.
+        block_size: Rows per cache page (indexer pool: 64).
 
     Returns:
         Logits ``[B * next_n, max_len]`` float32. Only ``[0, ctx)`` per row
@@ -269,14 +280,12 @@ def paged_fp8_mqa_logits_cuda(
     assert next_n == 1, "sm_80 port supports next_n=1 only (no MTP)"
     assert q.dtype == torch.float8_e4m3fn
     assert kv_cache.dtype == torch.uint8
+    assert kv_cache.dim() == 2
     assert head_size >= 16 and head_size & (head_size - 1) == 0
-    assert kv_cache.stride(2) == 1
-    assert kv_cache.stride(1) == head_size + 4
-    # The cache is a view into a packed pool: the block stride is the pool's
-    # byte span (shared by several layer types), rows are contiguous within a
-    # block. Addressing is block_id * stride(0) + off * stride(1).
-    assert kv_cache.stride(0) >= kv_cache.shape[1] * kv_cache.stride(1), (
-        "block stride smaller than logical block size"
+    assert kv_cache.stride(1) == 1
+    assert kv_cache.shape[1] == block_size * (head_size + 4), (
+        "raw block-layout pool buffer expected: "
+        "[num_blocks, block_size * (D + 4)]"
     )
     assert kv_cache.stride(0) % 4 == 0 and kv_cache.data_ptr() % 4 == 0, (
         "fp32 scale load needs 4B alignment"
@@ -294,7 +303,7 @@ def paged_fp8_mqa_logits_cuda(
         block_tables,
         logits,
         max_len,
-        kv_cache.shape[1],
+        block_size,
         next_n,
         NUM_HEADS=num_heads,
         HEAD_SIZE=head_size,
@@ -305,7 +314,6 @@ def paged_fp8_mqa_logits_cuda(
         stride_logits_m=logits.stride(0),
         stride_bt_b=block_tables.stride(0),
         stride_cache_b=kv_cache.stride(0),
-        stride_cache_n=kv_cache.stride(1),
         num_warps=4,
     )
     return logits
@@ -323,21 +331,24 @@ def sglang_paged_mqa_logits(
 ):
     """DeepGEMM `fp8_paged_mqa_logits` signature adapter for sm_80.
 
-    q: [M, 1, H, D] fp8; kv_cache: [pages, 64, 1, 132] uint8 (scale in last
-    4 bytes of each 132B row); weights: [M, H] f32; seq_lens: [M, 1] int;
-    page_table: [M, max_blocks] int32 (block granularity 64 rows).
-    deep_gemm_metadata is ignored (None on sm80). Writes logits [M, max];
-    tail beyond each ctx is undefined — sglang's topk scans bounded by len.
+    q: [M, 1, H, D] fp8; kv_cache: the RAW per-layer indexer pool buffer
+    ``[pages, 64 * (D + 4)]`` uint8 (``get_index_k_with_scale_buffer``,
+    BEFORE the ``[pages, 64, 1, D + 4]`` view) in sglang's block layout — per
+    page ``[64 x D fp8 values | 64 x 4B fp32 scales]``. That view is
+    nominal-shape only (DeepGEMM layout convention); its strides do not
+    describe the real byte layout, so sm_80 takes the raw buffer instead.
+    weights: [M, H] f32; seq_lens: [M, 1] int; page_table: [M, max_blocks]
+    int32 (block granularity 64 rows). deep_gemm_metadata is ignored (None on
+    sm80). Writes logits [M, max]; tail beyond each ctx is undefined —
+    sglang's topk scans bounded by len.
     """
     assert not use_fp4
-    kv = kv_cache.squeeze(2)
-    assert kv.dim() == 3
-    logits = paged_fp8_mqa_logits_cuda(
+    assert kv_cache.dtype == torch.uint8 and kv_cache.dim() == 2
+    return paged_fp8_mqa_logits_cuda(
         q,
-        kv,
+        kv_cache,
         weights,
         seq_lens,
         page_table,
         max_len=int(max_seq_len),
     )
-    return logits
