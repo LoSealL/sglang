@@ -3,6 +3,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.triton_fp8_mqa_logits_cuda import (
+    _f32_to_e4m3_bits,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -11,11 +14,11 @@ fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 @triton.jit
 def _quant_k_cache_fused_kernel(
     k_bf16_ptr,
-    k_nope_fp8_ptr,
+    k_nope_u8_ptr,
     k_rope_bf16_ptr,
     scale_k_nope_uint8_ptr,
     k_bf16_stride_0,
-    k_nope_fp8_stride_0,
+    k_nope_u8_stride_0,
     k_rope_bf16_stride_0,
     scale_stride_0,
     DIM_NOPE: tl.constexpr,
@@ -55,12 +58,14 @@ def _quant_k_cache_fused_kernel(
         scale_pow2_fp32 = tl.exp2(ceil_log2)
         scale_inv = 1.0 / scale_pow2_fp32
         x_scaled = x_fp32 * scale_inv
-        x_fp8 = tl.clamp(x_scaled, FP8_MIN, FP8_MAX).to(k_nope_fp8_ptr.dtype.element_ty)
+        # Software e4m3 encode (RNE, same bits as .to(fp8)): Triton rejects
+        # fp8e4nv pointers on sm_80, so the store goes through a uint8 view.
+        x_u8 = _f32_to_e4m3_bits(tl.clamp(x_scaled, FP8_MIN, FP8_MAX))
 
         out_fp8_offsets = (
-            token_id * k_nope_fp8_stride_0 + tile_id * TILE_SIZE + tile_range
+            token_id * k_nope_u8_stride_0 + tile_id * TILE_SIZE + tile_range
         )
-        tl.store(k_nope_fp8_ptr + out_fp8_offsets, x_fp8)
+        tl.store(k_nope_u8_ptr + out_fp8_offsets, x_u8)
 
         exponent = ceil_log2.to(tl.int32)
         scale_uint8 = (exponent + 127).to(tl.uint8)
@@ -97,7 +102,7 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
     grid = (num_tokens, num_tiles + 1)
     _quant_k_cache_fused_kernel[grid](
         k_bf16,
-        k_nope_fp8,
+        k_nope_fp8.view(torch.uint8),
         k_rope_bf16,
         scale_k_nope_ue8m0,
         k_bf16.stride(0),

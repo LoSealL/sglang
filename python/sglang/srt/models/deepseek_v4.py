@@ -167,7 +167,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
 )
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -209,7 +209,8 @@ def _get_mhc_ops() -> MhcOps:
 
 logger = logging.getLogger(__name__)
 
-_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+# deep_gemm's wo_a fp8_einsum JITs for Hopper+; sm80 runs the bf16 einsum path.
+_FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get() and not is_sm80_supported()
 _MHC_POST_MULT_VALUE = 2.0
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
@@ -1427,13 +1428,10 @@ class MQALayer(MqaAttentionBase):
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
-            else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # heads inject NaN into attention on gfx942 (fnuz); allocator
+            # layout shifts at large context lengths hit the same garbage on
+            # other archs, so always zero-init the padding.
+            q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink()
@@ -1745,7 +1743,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get():
+        # deep_gemm's tf32_hc_prenorm_gemm (inside _flashinfer_hc_pre) is
+        # Hopper-only; fall back to the sm80-safe paths below.
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC.get() and not is_sm80_supported():
             y, post, comb = _flashinfer_hc_pre(
                 x,
                 hc_fn,
@@ -1795,7 +1795,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, False
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        # deep_gemm's tf32_hc_prenorm_gemm asserts "Unsupported architecture"
+        # on sm80; fall back to the pure-torch prenorm there.
+        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get() and not is_sm80_supported():
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
                 tf32_hc_prenorm_gemm,
             )
@@ -3288,7 +3290,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+        if not _FP8_WO_A_GEMM:
             weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING

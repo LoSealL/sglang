@@ -43,7 +43,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm120_supported, is_sm80_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -489,6 +489,9 @@ class C4IndexerBackendMixin:
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
         if not is_cuda() or is_hip():
             return False
+        if is_sm80_supported():
+            # The non-paged plan calls CUDA DeepGEMM fp8_mqa_logits directly.
+            return False
         # The gather plan is built from eager, child-local ForwardBatch metadata.
         # Rewritten, TBO-split, and graph-backed batches must use the paged path.
         if (
@@ -705,8 +708,13 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        sm80_triton_logits = False
         if use_fp4_indexer:
             weights = weights.float()
+            if is_sm80_supported():
+                raise RuntimeError(
+                    "FP4 indexer requires DeepGEMM (Hopper+); not available on SM80"
+                )
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
@@ -721,6 +729,15 @@ class C4IndexerBackendMixin:
                 fn = fp8_paged_mqa_logits_torch_sm120
             else:
                 fn = fp8_paged_mqa_logits_torch
+        elif is_sm80_supported():
+            # A100: DeepGEMM unavailable; Triton kernel with software e4m3.
+            from sglang.kernels.ops.attention.dsv4.triton_fp8_mqa_logits_cuda import (
+                sglang_paged_mqa_logits as fn,
+            )
+
+            # The adapter reads the raw block-layout pool buffer directly; the
+            # [., 64, 1, 132] view below is the DeepGEMM nominal shape only.
+            sm80_triton_logits = True
         elif is_xpu():
             from sgl_kernel import fp8_paged_mqa_logits_triton
 
@@ -774,10 +791,11 @@ class C4IndexerBackendMixin:
                 layer_id=c4_indexer.layer_id,
             )
             assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
-            )
+            if not sm80_triton_logits:
+                head_dim_with_sf = 68 if use_fp4_indexer else 132
+                c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                    c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
+                )
             logits = fn(
                 q,
                 c4_indexer_kv_cache,
@@ -832,7 +850,11 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif (
+            envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and not is_sm80_supported()
+            and raw_indices is None
+        ):
             topk_transform_512_v2(
                 logits,
                 c4_seq_lens,

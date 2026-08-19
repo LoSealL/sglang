@@ -1,9 +1,10 @@
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.triton_fp8_mqa_logits_cuda import (
+    _fp8e4m3_to_f32,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -25,7 +26,7 @@ def dequantize_k_cache_paged(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     page_size: int,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
@@ -50,8 +51,8 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    # Two typed views over the same underlying bytes (uint8 + bf16); the fp8
+    # values are software-decoded (Triton rejects fp8e4nv pointers on sm_80).
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
 
@@ -67,9 +68,8 @@ def dequantize_k_cache_paged(
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
-        buf_fp8,
-        buf_bf16,
         buf_uint8,
+        buf_bf16,
         page_table_1_flattened,
         out.stride(0),
         BYTES_PER_PAGE=bytes_per_page,
@@ -88,9 +88,8 @@ def dequantize_k_cache_paged(
 @triton.jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
-    buf_fp8_ptr,
+    buf_u8_ptr,
     buf_bf16_ptr,
-    buf_uint8_ptr,
     page_table_ptr,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
@@ -119,9 +118,9 @@ def _dequantize_k_cache_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        fp8_vals = _fp8e4m3_to_f32(tl.load(buf_u8_ptr + fp8_off))
 
-        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
+        scale_u8 = tl.load(buf_u8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
 
         out_off = out_row_base + tile_id * TILE_SIZE + nope_offs

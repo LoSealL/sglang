@@ -132,7 +132,7 @@ class CompressStatePool:
             dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
         )
         if not online:
-            if _is_hip and ratio == 128:
+            if _is_hip or ratio == 128:
                 # Request-scoped C128 state is addressed by req_pool_idx (or a
                 # per-request ring).  The pool is allocated with torch.empty(),
                 # so a cold server can otherwise read uninitialized partial
