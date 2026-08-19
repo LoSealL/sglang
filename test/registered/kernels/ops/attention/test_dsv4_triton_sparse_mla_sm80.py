@@ -331,3 +331,40 @@ def test_sparse_mla_split_matches_single():
             num_splits=S,
         )
         torch.testing.assert_close(out_split, zeros, atol=3e-2, rtol=3e-2)
+
+
+def test_split_leading_all_padding_block():
+    """Regression (1M-ctx crash): a split whose FIRST block is entirely
+    padding (swa_len exactly one BLOCK_N + a comp segment of one -1 entry —
+    the c128-layer decode shape before any c128 slot exists) must not NaN.
+    Pre-fix, the online-softmax rescale computed exp(-inf - -inf) = NaN the
+    moment the split-K path activated (auto-gated on index-list width at
+    large --context-length)."""
+    sm = 512**-0.5
+    _swa_k, swa_buf = _make_pool(512, 128, seed=9)
+    _comp_k, comp_buf = _make_pool(64, 64, seed=10)
+    T, H = 1, 8
+    q = torch.randn(T, H, 512, dtype=torch.bfloat16, device="cuda")
+    sink = torch.full((H,), 0.25, device="cuda")
+    W = 160
+    swa_idx = torch.randint(0, 512, (T, W), device="cuda", dtype=torch.int32)
+    comp_idx = torch.full((T, 64), -1, device="cuda", dtype=torch.int32)
+    swa_len = torch.tensor([64], dtype=torch.int32, device="cuda")  # == BLOCK_N
+    comp_len = torch.tensor([1], dtype=torch.int32, device="cuda")  # idx[0] == -1
+    swa_idx[0, 64:] = -1
+
+    out_single = torch.empty_like(q)
+    triton_sparse_mla_fwd(
+        q, out_single, swa_buf, swa_idx, swa_len,
+        comp_buf, comp_idx, comp_len, sm, sink, swa_page=128, comp_page=64,
+    )
+    assert torch.isfinite(out_single).all()
+    for S in (2, 3, 4):
+        out_split = torch.empty_like(q)
+        triton_sparse_mla_fwd(
+            q, out_split, swa_buf, swa_idx, swa_len,
+            comp_buf, comp_idx, comp_len, sm, sink,
+            swa_page=128, comp_page=64, num_splits=S,
+        )
+        assert torch.isfinite(out_split).all(), f"num_splits={S} produced NaN"
+        torch.testing.assert_close(out_split, out_single, atol=3e-2, rtol=3e-2)

@@ -1428,13 +1428,10 @@ class MQALayer(MqaAttentionBase):
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
-            else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # heads inject NaN into attention on gfx942 (fnuz); allocator
+            # layout shifts at large context lengths hit the same garbage on
+            # other archs, so always zero-init the padding.
+            q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink()

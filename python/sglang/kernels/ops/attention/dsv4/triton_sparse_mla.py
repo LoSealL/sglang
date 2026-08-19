@@ -125,8 +125,13 @@ def _attend_packed(
         qk = tl.dot(q, tl.trans(kv)) * sm_scale
         qk = tl.where(mask_h[:, None] & valid[None, :], qk, float("-inf"))
         n_e_max = tl.maximum(tl.max(qk, 1), m)
-        re_scale = tl.exp(m - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
+        # When nothing is valid yet (m == -inf, e.g. a split's first block is
+        # all padding), exp(m - n_e_max) is exp(nan). Anchor the rescale to 0
+        # instead; exp(-inf) lanes still produce p = 0 and m keeps its -inf
+        # semantics for the reducer merge.
+        ref = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
+        re_scale = tl.exp(m - ref)
+        p = tl.exp(qk - ref[:, None])
         acc = acc * re_scale[:, None] + tl.dot(p.to(kv.dtype), kv).to(tl.float32)
         denom = denom * re_scale + tl.sum(tl.where(valid, p, 0.0), 1)
         m = n_e_max
