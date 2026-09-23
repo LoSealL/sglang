@@ -773,10 +773,18 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = default
     else:
         # Set prefill/decode backends based on hardware architecture.
-        if not user_set_prefill:
-            declared["dsa_prefill_backend"] = "flashmla_sparse"
-        if not user_set_decode:
-            declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+        # SM80: no FlashMLA/FA3/TRTLLM-Gen kernels; the TileLang sparse MLA
+        # kernel JITs for sm_80 (bf16 KV only).
+        if major < 9:
+            if not user_set_prefill:
+                declared["dsa_prefill_backend"] = "tilelang"
+            if not user_set_decode:
+                declared["dsa_decode_backend"] = "tilelang"
+        else:
+            if not user_set_prefill:
+                declared["dsa_prefill_backend"] = "flashmla_sparse"
+            if not user_set_decode:
+                declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
@@ -1306,9 +1314,9 @@ def _cutedsl_prefill_backend_fill(view: Any) -> dict:
         or view.prefill_attention_backend == "cutedsl_mla"
     ):
         return {}
-    assert view.prefill_attention_backend != "cutedsl_mla", (
-        "CuteDSL MLA only supports decoding for now"
-    )
+    assert (
+        view.prefill_attention_backend != "cutedsl_mla"
+    ), "CuteDSL MLA only supports decoding for now"
     if not get_platform().is_sm100:
         raise ValueError(
             "CuteDSL MLA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -1488,13 +1496,13 @@ def _dp_lm_head_validation(view: Any) -> dict:
     dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
     values through the view."""
     if view.enable_dp_lm_head:
-        assert view.enable_dp_attention, (
-            "Please enable dp attention when setting enable_dp_lm_head. "
-        )
+        assert (
+            view.enable_dp_attention
+        ), "Please enable dp attention when setting enable_dp_lm_head. "
     if view.enable_tp_lm_head_all_to_all:
-        assert view.enable_dp_attention, (
-            "Please enable dp attention when setting enable_tp_lm_head_all_to_all."
-        )
+        assert (
+            view.enable_dp_attention
+        ), "Please enable dp attention when setting enable_tp_lm_head_all_to_all."
         assert not view.enable_dp_lm_head, (
             "--enable-tp-lm-head-all-to-all uses a TP-sharded LM head and is "
             "incompatible with --enable-dp-lm-head."
@@ -1925,9 +1933,9 @@ def mamba_cache_chunk_size(server_args: Any) -> int:
         hf_config = model_config_of(server_args).hf_config
         chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
         page_size = resolved_view(server_args).page_size
-        assert max(chunk_size, page_size) % min(chunk_size, page_size) == 0, (
-            f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
-        )
+        assert (
+            max(chunk_size, page_size) % min(chunk_size, page_size) == 0
+        ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
         if not getattr(server_args, "_resolution_finished", False):
             return max(chunk_size, page_size)
         server_args._mamba_cache_chunk_size = max(chunk_size, page_size)

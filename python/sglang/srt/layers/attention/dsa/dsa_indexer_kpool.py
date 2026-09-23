@@ -106,9 +106,9 @@ class IndexerKPool(MultiPlatformOp):
             f"index_topk ({self.index_topk}) must be divisible by "
             f"index_kpool ({self.index_kpool})"
         )
-        assert 64 % self.index_kpool == 0, (
-            f"index_kpool ({self.index_kpool}) must divide page_size (64)"
-        )
+        assert (
+            64 % self.index_kpool == 0
+        ), f"index_kpool ({self.index_kpool}) must divide page_size (64)"
 
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)
@@ -860,7 +860,12 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(q_fp8)
+        # ponytail: SM80 has no DeepGEMM/TileLang-FP8 kernels; bf16 cuBLAS
+        # fallback (sm80_mqa_logits). Remove when a native SM80 path exists.
+        use_sm80_fallback = is_cuda() and not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        use_tilelang_paged_mqa = (
+            not use_sm80_fallback and self._should_use_tilelang_paged_mqa_logits(q_fp8)
+        )
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -868,11 +873,27 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables,
                 seqlens_32,
                 blocksize,
-                build_schedule_metadata=not use_tilelang_paged_mqa,
+                build_schedule_metadata=not use_tilelang_paged_mqa
+                and not use_sm80_fallback,
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
-        if use_tilelang_paged_mqa:
+        if use_sm80_fallback:
+            from sglang.kernels.ops.attention.dsa.sm80_mqa_logits import (
+                sm80_fp8_paged_mqa_logits,
+            )
+
+            logits = sm80_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                pool_context_lens,
+                pool_block_tables,
+                pool_schedule_metadata,
+                pool_max_seq_len,
+                clean_logits=False,
+            )
+        elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
             )
@@ -909,6 +930,17 @@ class IndexerKPool(MultiPlatformOp):
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
         return topk_result
+
+    @staticmethod
+    def _mqa_logits(q_fp8, kv, weights, ks, ke, clean_logits=True):
+        # ponytail: SM80 bf16 fallback; see sm80_mqa_logits docstring
+        if is_cuda() and not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            from sglang.kernels.ops.attention.dsa.sm80_mqa_logits import (
+                sm80_fp8_mqa_logits,
+            )
+
+            return sm80_fp8_mqa_logits(q_fp8, kv, weights, ks, ke, clean_logits)
+        return deep_gemm.fp8_mqa_logits(q_fp8, kv, weights, ks, ke, clean_logits)
 
     def _should_chunk_mqa_logits(
         self, num_q: int, num_k: int, device: torch.device
@@ -949,9 +981,9 @@ class IndexerKPool(MultiPlatformOp):
         total_k_rows = plan.ragged_total_k_rows
 
         n_real = seq_lens_expanded.shape[0]
-        assert n_real <= total_q, (
-            f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
-        )
+        assert (
+            n_real <= total_q
+        ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
 
         if total_k_rows > 0:
             k_u8 = plan.ragged_k_u8
@@ -967,7 +999,7 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
+            logits = self._mqa_logits(
                 q_fp8[:n_real].contiguous(),
                 (k_fp8.contiguous(), k_scale.contiguous()),
                 weights[:n_real].contiguous(),
@@ -1199,7 +1231,7 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = deep_gemm.fp8_mqa_logits(
+                local_logits = self._mqa_logits(
                     q_fp8[q_slice].contiguous(),
                     (k_fp8.contiguous(), k_scale.contiguous()),
                     weights[q_slice].contiguous(),

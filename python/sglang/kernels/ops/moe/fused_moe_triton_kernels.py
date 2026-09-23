@@ -322,6 +322,21 @@ def fused_moe_kernel_gptq_awq(
 
 
 @triton.jit
+def _u8_to_fp32_e4m3(u):
+    """Exact decode of float8_e4m3fn from uint8 bits.
+
+    ponytail: SM80 triton cannot touch fp8e4nv pointers at all, so fp8
+    tensors are viewed as uint8 before launch and decoded in-kernel.
+    Bit trick: (u << 7) bitcast to fp16 yields (1+m/8)*2^(e-15) for normals
+    and m*2^-17 for subnormals; both scale to e4m3 semantics by x256 —
+    no exp2/SFU, exact for every finite e4m3fn value.
+    """
+    h16 = ((u.to(tl.uint16) & 0x80) << 8) | ((u.to(tl.uint16) & 0x7F) << 7)
+    h = tl.cast(h16, tl.float16, bitcast=True) * 256.0
+    return h.to(tl.float32)
+
+
+@triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -372,6 +387,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
+    FP8_DEQUANT: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
@@ -571,6 +587,11 @@ def fused_moe_kernel(
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
 
         # We accumulate along the K dimension.
+        if FP8_DEQUANT:
+            # ponytail: SM80 triton cannot touch fp8e4nv; A/B are passed as
+            # uint8 views and decoded exactly to bf16 before the dot.
+            a = _u8_to_fp32_e4m3(a).to(compute_type)
+            b = _u8_to_fp32_e4m3(b).to(compute_type)
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
@@ -871,9 +892,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert per_channel_quant, (
-                "int8 quantization only supports channel-wise quantization except for block-wise quantization"
-            )
+            assert (
+                per_channel_quant
+            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -907,23 +928,23 @@ def invoke_fused_moe_kernel(
     if fuse_sum_all_reduce:
         assert not c_sorted, "fuse_sum_all_reduce only supports c_sorted=False"
     if fuse_add_to_output:
-        assert not fuse_sum_all_reduce, (
-            "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
-        )
-        assert add_output_mask is not None, (
-            "add_output_mask required when fuse_add_to_output=True"
-        )
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_add_to_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when fuse_add_to_output=True"
     # ===== TO BE REFACTORED ====
     if mask_output:
-        assert not fuse_add_to_output, (
-            "mask_output and fuse_add_to_output are mutually exclusive"
-        )
-        assert not fuse_sum_all_reduce, (
-            "mask_output and fuse_sum_all_reduce are mutually exclusive"
-        )
-        assert add_output_mask is not None, (
-            "add_output_mask required when mask_output=True"
-        )
+        assert (
+            not fuse_add_to_output
+        ), "mask_output and fuse_add_to_output are mutually exclusive"
+        assert (
+            not fuse_sum_all_reduce
+        ), "mask_output and fuse_sum_all_reduce are mutually exclusive"
+        assert (
+            add_output_mask is not None
+        ), "add_output_mask required when mask_output=True"
     # ===== END TO BE REFACTORED ====
 
     if (
@@ -931,9 +952,9 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert not fuse_sum_all_reduce, (
-            "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
-        )
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
@@ -1001,10 +1022,18 @@ def invoke_fused_moe_kernel(
             if is_arch_support_pdl()
             else {}
         )
+        # ponytail: SM80 triton cannot touch fp8e4nv pointers; pass uint8
+        # views and decode in-kernel (FP8_DEQUANT).
+        fp8_dequant = (
+            use_fp8_w8a8
+            and A.dtype == torch.float8_e4m3fn
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] < 9
+        )
         fused_moe_kernel[grid](
-            A,
+            A if not fp8_dequant else A.view(torch.uint8),
             a_desc,
-            B,
+            B if not fp8_dequant else B.view(torch.uint8),
             b_desc,
             bias,
             C,
@@ -1039,6 +1068,7 @@ def invoke_fused_moe_kernel(
             top_k=top_k,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
+            FP8_DEQUANT=fp8_dequant,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             per_channel_quant=per_channel_quant,
@@ -1564,9 +1594,9 @@ def fused_append_shared_experts_with_weights(
       ``apply_sigmoid`` (the sigmoid is intrinsic), so the two are mutually
       exclusive.
     """
-    assert not (fuse_gate and apply_sigmoid), (
-        "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
-    )
+    assert not (
+        fuse_gate and apply_sigmoid
+    ), "fuse_gate already applies sigmoid in-kernel; do not also set apply_sigmoid"
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1574,9 +1604,9 @@ def fused_append_shared_experts_with_weights(
         return topk_ids, topk_weights
 
     if fuse_gate:
-        assert hidden_states is not None and gate_weight is not None, (
-            "fuse_gate=True requires hidden_states and gate_weight"
-        )
+        assert (
+            hidden_states is not None and gate_weight is not None
+        ), "fuse_gate=True requires hidden_states and gate_weight"
         hidden_arg = hidden_states.contiguous()
         wgate_arg = gate_weight.reshape(-1).contiguous()
         hidden_dim = hidden_arg.shape[1]
