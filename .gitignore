@@ -287,5 +287,5 @@ artifacts/
 internal-docs/
 
 # GLM-5.3-Flash local serving (scripts/serve_glm_flash.sh runtime artifacts)
-scripts/log-glm-flash*.txt
+/log-glm-flash.txt
 scripts/.glm-flash.pid

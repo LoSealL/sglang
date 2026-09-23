@@ -5,8 +5,9 @@ set -u
 
 MODEL="zai-org/GLM-5.3-Flash"
 ALIAS="local-glm-flash"
-PORT=30000
-LOG_FILE="$(dirname "$0")/log-glm-flash.txt"
+HOST_IP=172.16.50.100
+PORT=8000
+LOG_FILE="$(cd "$(dirname "$0")/.." && pwd)/log-glm-flash.txt"
 PID_FILE="$(dirname "$0")/.glm-flash.pid"
 LOG_MAX_BYTES=$((100 * 1024 * 1024)) # truncate the log at 100MB
 
@@ -48,7 +49,7 @@ do_start() {
         --served-model-name "$ALIAS" \
         --tp 8 --kv-cache-dtype bfloat16 \
         --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \
-        --host 0.0.0.0 --port "$PORT" \
+        --host "$HOST_IP" --port "$PORT" \
         --mem-fraction-static 0.85 \
         --decode-log-interval 10 \
         >> "$LOG_FILE" 2>&1 < /dev/null &
@@ -58,8 +59,8 @@ do_start() {
     echo "server pid $pid; waiting for health..."
     for _ in $(seq 1 60); do
         sleep 10
-        if curl -s -m 3 "http://127.0.0.1:$PORT/health" -o /dev/null; then
-            echo "READY: http://127.0.0.1:$PORT (model alias: $ALIAS)"
+        if curl -s -m 3 "http://$HOST_IP:$PORT/health" -o /dev/null; then
+            echo "READY: http://$HOST_IP:$PORT (model alias: $ALIAS)"
             return 0
         fi
         if ! kill -0 "$pid" 2>/dev/null; then
