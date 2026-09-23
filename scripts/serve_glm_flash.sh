@@ -51,6 +51,7 @@ do_start() {
         --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \
         --host "$HOST_IP" --port "$PORT" \
         --mem-fraction-static 0.85 \
+        --reasoning-parser glm45 --tool-call-parser glm47 \
         --decode-log-interval 10 \
         >> "$LOG_FILE" 2>&1 < /dev/null &
     local pid=$!
