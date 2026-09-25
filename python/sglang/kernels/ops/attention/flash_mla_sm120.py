@@ -731,6 +731,13 @@ def flashinfer_sparse_mla_forward(
     """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
+    # Under breakable prefill-graph replay the batch is padded up to the
+    # captured bucket while q is sliced to the true token count; flashinfer
+    # derives batch_size from q and rejects a padded seq_lens. Trim the
+    # trailing pad rows (eager passes seq_lens == q.shape[0], a no-op).
+    if seq_lens.shape[0] > q.shape[0]:
+        seq_lens = seq_lens[: q.shape[0]]
+
     topk = indices.shape[1]
     result = trtllm_batch_decode_with_kv_cache_mla(
         query=q.unsqueeze(1),

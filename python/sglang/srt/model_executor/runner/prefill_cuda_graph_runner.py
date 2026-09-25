@@ -140,6 +140,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
     get_available_gpu_memory,
+    get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
     is_cuda,
     is_npu,
@@ -369,6 +370,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = get_prefill_num_tokens_to_capture(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+
+        # Under the attn-TP scattered-MLP layout (DP attention with a gathered
+        # buffer), every captured forward runs
+        # attn_tp_reduce_scatter_tensor(hidden[nt/8], hidden[nt]), whose
+        # tensor_split geometry requires num_tokens divisible by attn_tp_size
+        # (and by 2 more under TBO, by attn_cp under CP — exactly the factors
+        # get_cuda_graph_batch_size_alignment composes). The eager path pads
+        # via prepare_attn_tp_scatter_input, but the captured bucket geometry
+        # is fixed, so indivisible buckets (e.g. 4, 12, 20, 28 with
+        # attn_tp_size=8) crash capture with "input tensor must be the same
+        # size as output size times world size". Drop them; replay pads those
+        # batch sizes up to the next surviving bucket.
+        alignment = get_cuda_graph_batch_size_alignment()
+        if alignment > 1:
+            divisible = [t for t in self.capture_num_tokens if t % alignment == 0]
+            if divisible:
+                self.capture_num_tokens = divisible
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
