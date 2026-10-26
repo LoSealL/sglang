@@ -1251,7 +1251,20 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        # SM120 (RTX PRO / RTX 6000D class) caps dynamic shared memory at
+        # ~100 KB per block. BI=64 with two pipeline stages needs ~148 KB;
+        # one stage fits. Keep BI=64 so the 16-row Q tile still satisfies
+        # TileLang's warp_row_tiles >= 16 requirement.
+        extra = {}
+        if (
+            not _is_hip
+            and tail_dim == 0
+            and torch.cuda.get_device_capability(q.device)[0] >= 12
+        ):
+            extra["num_stages"] = 1
+        kernel = kernel_factory(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, **extra
+        )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
