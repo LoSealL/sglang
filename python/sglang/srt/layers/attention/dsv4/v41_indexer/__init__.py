@@ -47,6 +47,14 @@ def is_sm100_or_newer() -> bool:
 
 
 @functools.cache
+def is_sm100_family() -> bool:
+    # The paged variant additionally needs block_kv in {32, 64, 128} on SM100,
+    # but strictly 64 on SM120/121 (deepgemm csrc/apis/attention.hpp); the V4.1
+    # compressed-KV page layout (block_kv=256) only fits the SM100 builds.
+    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
+
+
+@functools.cache
 def has_dense_fp4_indexer() -> bool:
     if not torch.cuda.is_available() or torch.version.cuda is None:
         return False
@@ -82,7 +90,7 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=is_sm100_family(),
     )
 
 
@@ -107,7 +115,9 @@ def make_candidate_indexer(
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
-    if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+    # SM120's paged-logits kernel only accepts block_kv=64 while the V4.1 page
+    # layout is 256, so it takes the dense-blocks candidate scheme as well.
+    if not is_sm100_family() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (

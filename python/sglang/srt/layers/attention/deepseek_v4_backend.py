@@ -1500,14 +1500,16 @@ class DeepseekV4AttnBackend(
                 cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
-            if (
-                swa_replay_start is not None
-                and swa_replay_start.shape[0] < padded_num_tokens
-            ):
-                swa_replay_start = torch.nn.functional.pad(
-                    swa_replay_start,
-                    (0, padded_num_tokens - swa_replay_start.shape[0]),
-                )
+        # Eager extend batches bucket-pad out_cache_loc beyond the real tail
+        # rows; padding rows keep floor 0 (no clamp), matching _pad_rows.
+        if (
+            swa_replay_start is not None
+            and swa_replay_start.shape[0] < padded_num_tokens
+        ):
+            swa_replay_start = torch.nn.functional.pad(
+                swa_replay_start,
+                (0, padded_num_tokens - swa_replay_start.shape[0]),
+            )
 
         num_write_tokens = (
             out_cache_loc.shape[0] if use_prefill_cuda_graph else num_tokens
@@ -3252,7 +3254,15 @@ class DeepseekV4AttnBackend(
             # live rows only and falls through.
             req, pos = hoisted_req, hoisted_pos
         else:
-            req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+            # Eager batches can carry late-layer tail/padding rows beyond
+            # sum(extend_seq_lens) (positions is bucket-sized); the graph-tail
+            # builder maps those to the last request, so does the eager fall-
+            # through instead of asserting inside repeat_interleave.
+            req = token_req_indices(forward_batch)
+            if req.shape[0] < positions.shape[0]:
+                req = torch.cat(
+                    [req, req[-1:].expand(positions.shape[0] - req.shape[0])]
+                )
             pos = positions
         if (
             forward_batch.forward_mode.is_extend()

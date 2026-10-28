@@ -62,7 +62,12 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
-    if not DEEPGEMM_BLACKWELL:
+    # SM120/121 (RTX 6000D class) ships the same paged sparse MQA logits APIs
+    # via the DeepGEMM#324 mma.sync path; probe instead of hard-gating on
+    # SM100, mirroring _sm120_deep_gemm_apis_available.
+    if not ENABLE_JIT_DEEPGEMM or not (
+        get_platform().is_sm100 or get_device_sm() in (120, 121)
+    ):
         return False
     import deep_gemm
 
