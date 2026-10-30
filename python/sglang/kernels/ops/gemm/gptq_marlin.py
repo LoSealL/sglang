@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import functools
+
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -26,10 +28,22 @@ def _jit_gptq_marlin_module(dtype: torch.dtype) -> Module:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _zero_len(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """The shared zero-length stand-in for an absent optional operand.
+
+    One tensor per (device, dtype): the wrapper asks for this once per absent
+    argument per call, so allocating it fresh resolves the device string every
+    time -- thousands of `_get_device_index`/`_lazy_init` round trips per step.
+    Nothing writes to it (its extent is zero), so sharing is safe.
+    """
+    return torch.empty(0, device=device, dtype=dtype)
+
+
 def _or_empty(
     t: Optional[torch.Tensor], device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    return t if t is not None else torch.empty(0, device=device, dtype=dtype)
+    return t if t is not None else _zero_len(device, dtype)
 
 
 @debug_kernel_api
