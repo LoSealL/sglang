@@ -493,6 +493,60 @@ That reframes the remaining gap: 322 ms of wall minus 252 ms of GPU-busy leaves
 same collective ~2 ms apart, forty times a step. Only deterministic replay (a
 captured prefill) removes that, which is the same project as above.
 
+#### A full prefill graph on Ampere: how far it gets, and the one wall
+
+`--cuda-graph-backend-prefill full` now walks past every layer above the model
+and stops in the indexer. What it took, in order, each one an error from a real
+capture attempt:
+
+1. `_GraphBucket.of` had no `EXTEND` and raised. Prefill graphs are token-keyed,
+   so `EXTEND` is looked up by query-token count, not by request slots; the rest
+   of the enum (decode / target-verify / draft-extend) keys on `bs`.
+2. `init_forward_metadata_out_graph` had no extend branch. It now builds the
+   extend metadata through `init_forward_metadata_prefill(use_prefill_cuda_graph=
+   True)` from the runner's slot-padded static buffers, and returns
+   `graph_key = num_tokens` so two token buckets cannot collide.
+3. `cuda_graph_metadata_of_bucket_and_bs` only existed when a decode graph had
+   been built, so a prefill-only process crashed on it; the store is now created
+   on first use.
+4. The extend layout cannot come from `seq_lens_cpu` (this backend does not keep
+   it), so it is read off the static buffers. That also states the constraint:
+   *the graph is keyed by layout as well as token count*, since per-request
+   extend lengths decide the row order.
+
+Then the wall, and it is a single one:
+
+```
+_low_ratio_index_topk -> topk_prefill -> _torch_prefill
+  -> scoring.prefill_requests: torch.unique_consecutive(req).tolist(), lens.max().item()
+torch.AcceleratorError: operation not permitted when stream is capturing
+```
+
+That loop is host-side by construction. Blackwell never runs it: the
+`low_ratio_prefill_graph` gate (`has_dense_fp4_indexer() and
+is_sm100_or_newer()`) routes the same work through a paged fp4 logits kernel
+with precomputed row chunks. Note what the gate actually bundles -- the fp4
+kernel *and* the graph-safe indexer metadata -- because only the second is what
+a capture needs.
+
+The path through it on Ampere needs no new kernel, which is what makes it worth
+attempting rather than a rewrite:
+
+- `get_low_ratio_index_k_dequant` is pure tensor arithmetic (page/offset gather,
+  table lookup, `exp2`), no host sync.
+- `scoring.scores` is the fused `sparse_scores` Triton kernel already in this
+  branch, which is sync-free and 4.5x the einsum it replaced.
+- The three host reads are all replaceable with bucket constants plus device
+  tensors: the request boundaries are the layout (constant for a bucket),
+  `lens.max().item()` becomes one padded `lc_max` column count with the existing
+  `masked_fill(j >= lens)`, and the row loop bound becomes `lc_max`-derived
+  rather than `tok.numel()`.
+
+What that costs: every request is padded to the bucket's column count, so a
+short prefix in a large bucket scores up to `lc_max / real_lc` wasted work.
+Worth stating plainly, because it is the reason the eager path stays faster
+than a naive ported graph for small prefills.
+
 Avenues measured and closed, so they are not re-tried:
 
 - `--boundary-reduction ar` instead of `rs+rsv`: 0.343-0.346 s against 0.349,
