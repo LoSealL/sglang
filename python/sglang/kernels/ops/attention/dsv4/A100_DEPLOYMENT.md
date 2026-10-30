@@ -419,7 +419,14 @@ fixed and the marginal rate is 16.3k tok/s. At 4,004 tokens that predicts
 
 It cannot be amortized from the client either: two concurrent 3,800-token
 prefills take 0.722 s against 0.364 s for one, 10,539 tok/s against 10,402, so
-the scheduler runs them one at a time and charges the fixed cost to each.
+the scheduler runs them one at a time and charges the fixed cost to each. They
+are only batched when the second is already queued before the step forms, which
+for a 350 ms step means it never is: `#new-seq: 2` appears in the serving log
+only on a radix-cache hit, where the work left is small enough to share. That
+also makes those hits a measurement trap -- firing the same prompt twice and
+taking the faster run reports the cache, not the batch.
+
+### What the fixed cost leaves as levers
 
 ### What the fixed cost leaves as levers
 
