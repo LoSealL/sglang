@@ -323,6 +323,7 @@ one. `hc_mix_stats` then got its own SM80 schedule. Cumulative, on the same prom
 | + single-pass sparse MLA | 0.3580 s | 10,841 |
 | + `wo_a` matmul for G == 1, no-op output fill | 0.3490 s | 11,127 |
 | + fused relu-MQA scorer | 0.3450 s | 11,287 |
+| + `--boundary-reduction ar` | 0.3430 s | 11,332 |
 
 Measure the first request twice before believing any of these: the first
 requests after a launch still pay Triton JIT for the new specializations, and
@@ -428,7 +429,63 @@ taking the faster run reports the cache, not the batch.
 
 ### What the fixed cost leaves as levers
 
-### What the fixed cost leaves as levers
+#### The step is paced by per-token Python, and that sets the ceiling
+
+Measured with a CUDA event pair around `model_runner.forward` (one stream, no
+profiler), so the two halves are directly comparable:
+
+| prompt tokens | cpu_issue | gpu_exec | wall |
+| ---: | ---: | ---: | ---: |
+| 2,048 (one chunk) | 175.5 ms | 175.9 ms | 175.9 ms |
+| 4,004 | 321.3 ms | 322.1 ms | 322.1 ms |
+
+Both scale the same way, and the slopes are the answer: **74.5 us of CPU issue
+per token plus ~23 ms fixed, against 61.5 us of GPU per token**. cpu_issue and
+gpu_exec agree to within a millisecond because the stream idles whenever the
+CPU has not issued the next kernel yet -- the GPU is not the pacer, the
+75 us/token of Python is.
+
+That closes the arithmetic for a 4,000-token prefill:
+
+- 15,000 tok/s is 66.7 us/token.
+- GPU work fits (61.5 us/token, so 16.3k would be the device ceiling).
+- CPU issue does not: it needs 66.7 us/token and currently takes 80.
+
+So the target is a **17% cut in per-token dispatch**, and nothing else. It is
+also why batching does not help: a bigger step pays the same 74.5 us/token.
+
+Where those 73 torch-level calls per token go, from the three-step trace
+(291,947 `python_function` events a step, 95k of them in `sglang/`):
+
+| family | calls/token | note |
+| --- | ---: | --- |
+| `runtime_context` reads (`_read`, `get_parallel`, `getter`, `config_bag`) | 4.7 | resolved per layer, not per forward |
+| `layer_boundary` stage/row-transport scaffolding | 1.1 | `stage.finish -> row_transport.finish -> any(genexpr) -> _sum_group -> get_parallel`, every layer |
+| `nvtx_utils` + `scheduler_stage_metrics` wrappers | 1.7 | already `_NULL_CONTEXT` fast paths; ~1 us each |
+| everything else (torch's own per-op dispatch) | ~65 | `nn.Module.__getattr__`, `is_scripting`, `native_specialize_impl` |
+
+The four cheap families above are ~7.5 calls/token, i.e. the 17% if all of
+them go -- and the largest of them, `runtime_context`, is the design's
+per-forward-flag idiom applied per layer instead.
+
+Avenues measured and closed, so they are not re-tried:
+
+- `--boundary-reduction ar` instead of `rs+rsv`: 0.343-0.346 s against 0.349,
+  the best single-stream config here (11,332 tok/s), and the only knob that
+  moved.
+- `--enable-torch-compile`: nothing. It binds `torch.compile` in
+  `model_executor/cpu_graph_runner.py`, i.e. the CPU-graph mode, not this path.
+- `--enable-prefill-cp --cp-strategy interleave`: resolves `attn_cp_size` to
+  the whole TP group, which sets `moe_dense_tp_size=1` -- the dense weights
+  replicate and the load OOMs by 720 MiB even at `--mem-fraction-static 0.86`.
+  It also needs `language_model_only` because the checkpoint ships a vision
+  tower that rejects CP outright ("V4.1 vision supports TP/EP/DP without CP or
+  PP").
+- `--enable-prefill-delayer`: its queue trigger needs requests to arrive while
+  a step runs, which is exactly what a 350 ms step prevents.
+- Prefill CUDA graphs: `breakable` breaks at attention boundaries and rebuilds
+  attention metadata at replay, so attention -- the largest Python block -- is
+  never inside a graph, which is why capture measured 0.330 s against 0.332.
 
 Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
 106 ms is dispatch, so the levers are, in order:
