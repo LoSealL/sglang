@@ -317,6 +317,41 @@ the prefix cache and inflate the number several-fold. Verify against the
 server's own `Prefill batch ... input throughput` line before quoting any
 prefill measurement.
 
+Note that the `input throughput` line divides by wall time since the previous
+batch, so it also counts any idle gap. A prompt that arrives after a quiet spell
+reports ~20 tok/s for the same work that measures 3,400 tok/s from the client.
+Time-to-first-token is the measurement to trust.
+
+### Where the time goes, and whether it is compute bound
+
+`torch.profiler` on a 4,000-token prefill (TP8, three steps captured, so 120
+launches per layer set). Shares are of summed GPU time; the last column is what
+each part sustains against the A100-SXM4 bf16 peak of 312 TFLOPS.
+
+| Kernel group | GPU time | Share | FLOPs | Achieved |
+| --- | ---: | ---: | ---: | ---: |
+| `_sparse_mla_prefill_kernel` | 339 ms | 30% | 1.7 TFLOP | 15 TFLOPS (5% peak) |
+| TP all-reduce (`2shot_pull` + NCCL) | 208 ms | 19% | — | — |
+| MoE (`fused_marlin_moe`) | 127 ms | 11% | 8.5 TFLOP | 200 TFLOPS (64% peak) |
+| Dense fp8 Marlin (attention projections) | 106 ms | 9% | 5.3 TFLOP | 121 TFLOPS (39% peak) |
+| `hc_mix_stats` + `mhc_post` + combine | 142 ms | 13% | — | — |
+| Everything else (fill, wo_a bf16, top-k) | 90 ms | 8% | — | — |
+
+So prefill is **not** compute bound: the run sustains ~41 TFLOPS aggregate, 13%
+of the bf16 ceiling. Only the MoE GEMM is near a practical limit, at 64%. The
+attention kernel is the largest single item and the furthest from any roofline —
+5% of compute peak and ~28% of HBM — because the two passes double the gathered
+KV reads, the tiles arrive through an index list rather than a contiguous copy,
+and the `BLOCK_H x 512` fp32 accumulator keeps occupancy at one program per SM.
+
+Retuning for the 8 heads a TP8 rank owns is what moved it: `BLOCK_H` 16 -> 8
+(padding 8 real heads to a 16-row MMA wastes more than it saves) and
+`BLOCK_KV` 64 -> 32 (room for three pipeline stages), 3.66 ms -> 2.03 ms per
+layer, and 8.2k -> 9.2k tok/s end to end. The end-to-end gain is smaller than
+the kernel gain because all-reduce is co-dominant at ~19%, and it varies between
+runs (132-235 ms across three profiles of the same workload), which is where the
+next real headroom is.
+
 ## Tests
 
 ```bash

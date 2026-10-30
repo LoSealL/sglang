@@ -26,7 +26,18 @@ per-block rescale that an online softmax needs.
 
 Measured on 8x A100-SXM4-80GB (TP8), single stream, no prefix-cache hits:
 about 3.3k tok/s at 600-token prompts rising to 8.2k tok/s at 4k, versus
-194 tok/s for the earlier scalar-reduction version.
+194 tok/s for the earlier scalar-reduction version. Retuning the tiles for the
+8 heads a TP8 rank actually owns (see ``_pick_block_h``) took the kernel from
+3.66 ms to 2.03 ms per layer at 4k tokens and moved the same measurement to
+9.2k tok/s.
+
+Even after that, one layer of this kernel sustains ~17 TFLOPS, about 5% of the
+A100 bf16 peak, and reads KV at ~580 GB/s, about 28% of HBM. It is neither
+compute nor bandwidth bound: the two passes double the gathered KV loads, each
+``[BLOCK_KV, D]`` tile arrives through an index list so it cannot use one
+contiguous copy, and the accumulator (BLOCK_H x 512 fp32) is large enough to
+keep occupancy at one program per SM. Those, not the MMA count, are what a
+faster version would have to attack.
 """
 
 from __future__ import annotations
@@ -187,26 +198,30 @@ def _sparse_mla_prefill_kernel(
 def _pick_block_kv(topk: int) -> int:
     """KV block height.
 
-    The tile is ``[BLOCK_KV, D]`` bf16 with D=512, so 64 rows already occupy
-    64 KiB of shared memory per staged copy; 128 does not fit alongside the
-    MMA operands on a 164 KiB part.
+    The tile is ``[BLOCK_KV, D]`` bf16 with D=512, so 32 rows are 32 KiB of
+    shared memory per staged copy and 64 rows are 64 KiB (128 does not fit
+    alongside the MMA operands on a 164 KiB part). 32 wins at every head count
+    measured on A100: it leaves room for three pipeline stages, and the extra
+    loop iterations cost less than the occupancy the smaller tile buys.
     """
-    if topk <= 32:
-        return 32
-    return 64
+    return 32
 
 
 def _pick_block_h(num_heads: int) -> int:
     """Query-head block height.
 
     MMA needs at least 16 rows, and beyond 32 the accumulator tile (BLOCK_H x
-    512 fp32) starts crowding out the KV staging buffer.
+    512 fp32) starts crowding out the KV staging buffer. A tensor-parallel rank
+    sees only ``num_heads / tp`` of them (8 at TP8), and padding those 8 up to
+    16 costs more than the wasted MMA lanes: measured 2.01 ms vs 3.62 ms for
+    the whole layer at 8 heads on A100, because the narrower accumulator keeps
+    more programs resident instead of spilling.
     """
     if num_heads >= 32:
         return 32
     if num_heads >= 16:
         return 16
-    return 16
+    return 8
 
 
 def flash_mla_sparse_prefill_triton(
