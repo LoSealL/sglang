@@ -431,11 +431,29 @@ Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
    `--cuda-graph-backend-prefill full` is not wired for this attention backend:
    `deepseek_v4_backend._GraphBucket.of` has `DECODE_OR_IDLE`, `TARGET_VERIFY`
    and `DRAFT_EXTEND` branches and raises `NotImplementedError` on `EXTEND`.
-   `--cuda-graph-backend-prefill breakable` does capture, but will not fit in
-   memory here: `--mem-fraction-static 0.86` is refused ("raise above 0.940,
-   minimum viable = 0.9394") and both 0.95 and 0.97 fail capture with a 320 MiB
-   request against 225 MiB free. That window is empty on 8x80 GB at
-   `--max-total-tokens 8192`; a smaller KV budget is what would open it.
+
+   `--cuda-graph-backend-prefill breakable` does capture, and the capture fits
+   once it is given room — the default bucket set does not. A full run captures
+   50 shapes and eats the headroom one at a time (4.52 GB -> 0.35 GB by the ninth
+   bucket); at `--max-total-tokens 4608 --mem-fraction-static 0.95
+   --cuda-graph-bs-prefill 4096 --cuda-graph-prefill-max-context 4096` with
+   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, a single bucket captures
+   and the server serves. Reserving the graph's memory before the KV pool is
+   sized is the same lever from the other side: the pool is only ever sized to
+   `mem-fraction-static`, so capping `--max-total-tokens` is what leaves the
+   ~320 MiB a capture needs.
+
+   It is not replayable yet, and the reason is not memory. The capture trips over
+   `token_req_indices` -> `repeat_interleave(..., output_size=None)` on
+   `extend_seq_lens`, which reduces that device tensor on the host: illegal while
+   capturing. Supplying an `output_size` gets past capture but breaks replay,
+   because the graph replays a fixed `result_size` while the kernel re-reads the
+   live lengths (`Repeat.cu: result_size == cumsum_ptr[size - 1]`). That is what
+   `forward_low_ratio_sources` already guards for with `hoisted_req` /
+   `hoisted_pos`, "bucket-sized under the prefill graph"; the capture path does
+   not populate them, so it falls into the eager branch. Wiring that hoisting is
+   the work item -- not a flag and not a memory knob.
+
 3. Two-batch overlap is what the 28% row suggested, and it would overlap the
    collectives with compute — but there is nothing to overlap. It is also
    blocked for DSV4.1 by `deepseek_v4_hook.validate_deepseek_v41_features`, and
