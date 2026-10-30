@@ -1172,6 +1172,7 @@ class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
     DRAFT_EXTEND = "draft_extend"
+    EXTEND = "extend"
 
     @classmethod
     def of(cls, forward_mode: ForwardMode) -> _GraphBucket:
@@ -1181,6 +1182,11 @@ class _GraphBucket(enum.Enum):
             return cls.TARGET_VERIFY
         if forward_mode.is_draft_extend_v2():
             return cls.DRAFT_EXTEND
+        if forward_mode.is_extend():
+            # Prefill graphs are token-keyed, not request-keyed: the bucket is
+            # looked up by the number of query tokens, and the request slots are
+            # padded by the runner.
+            return cls.EXTEND
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
@@ -2571,6 +2577,11 @@ class DeepseekV4AttnBackend(
                 out_cache_loc = torch.zeros_like(seq_lens)
             elif bucket == _GraphBucket.TARGET_VERIFY:
                 out_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
+            elif bucket == _GraphBucket.EXTEND:
+                # The runner hands the captured batch a token-sized static
+                # buffer for the write locations; the graph captures its address
+                # and replay refreshes its contents.
+                out_cache_loc = forward_batch.out_cache_loc
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
@@ -2725,6 +2736,43 @@ class DeepseekV4AttnBackend(
                 num_tokens_per_req=num_tokens_per_req,
                 out_cache_loc=out_cache_loc,
             )
+        elif bucket == _GraphBucket.EXTEND:
+            # Plumbing for a token-keyed prefill graph: this branch builds the
+            # extend metadata out of graph, and the captured body then reads it
+            # by address. It stops short of a working capture on Ampere, and the
+            # one remaining blocker is in the indexer rather than here:
+            # `_low_ratio_index_topk -> topk_prefill -> _torch_prefill ->
+            # scoring.prefill_requests` runs a host-side per-request loop
+            # (unique_consecutive().tolist(), lens.max().item()) which CUDA
+            # rejects during capture. The Blackwell path avoids it with the
+            # fp4 paged-logits kernel; on Ampere the same shape is reachable
+            # without a new kernel (dequant and scores are already
+            # sync-free -- see scoring.py), by padding every request to one
+            # bucket-constant column count and driving `sparse_scores` from
+            # device-side row/lens tensors.
+            self.online_c128_mtp.clear()
+            assert out_cache_loc is not None, "extend graph needs the write locations"
+            r = seq_lens.shape[0]
+            extend_seq_lens = forward_batch.extend_seq_lens[:r]
+            # The captured graph is keyed by the token layout as well as the
+            # token count: the per-request extend lengths decide the row order,
+            # so replay only accepts the layout it was captured with. Read them
+            # off the static buffers, which is where the runner keeps both.
+            extend_seq_lens_cpu = [int(x) for x in extend_seq_lens.tolist()]
+            temp_metadata = self.init_forward_metadata_prefill(
+                max_seq_len=chosen_max_seq_len,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=[int(x) for x in seq_lens[:r].tolist()],
+                out_cache_loc=out_cache_loc,
+                num_tokens=int(out_cache_loc.shape[0]),
+                extend_seq_lens=extend_seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                use_prefill_cuda_graph=True,
+                forward_batch=forward_batch,
+            )
+            # Prefill graphs are keyed by query tokens, not by request slots.
+            graph_key = int(out_cache_loc.shape[0])
         else:
             self.online_c128_mtp.clear()
             raise NotImplementedError
@@ -3207,7 +3255,15 @@ class DeepseekV4AttnBackend(
         ],
         bucket: _GraphBucket,
     ) -> None:
-        bucket_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket]
+        # A prefill graph can be the only graph this process builds (decode
+        # graphs are independently switchable), so the store is created on first
+        # use rather than in init_cuda_graph_state alone.
+        store = getattr(self, "cuda_graph_metadata_of_bucket_and_bs", None)
+        if store is None:
+            store = self.cuda_graph_metadata_of_bucket_and_bs = {
+                b: {} for b in _GraphBucket
+            }
+        bucket_metadata = store[bucket]
         chosen_metadata = bucket_metadata.get(bs)
         if chosen_metadata is None:
             bucket_metadata[bs] = temp_metadata
