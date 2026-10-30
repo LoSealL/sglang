@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.dsv4.sparse_scores import sparse_scores
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
@@ -26,6 +27,31 @@ from sglang.srt.utils import add_prefix, is_gfx95_supported
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
     # validated on CUDA and gfx950; other ROCm GPUs keep the torch forms
     return x.is_cuda and (torch.version.cuda is not None or is_gfx95_supported())
+
+
+# Smallest t*n the fused scorer is worth a launch for; below it the einsum's
+# materialised head dimension still fits in cache.
+_FUSED_SCORES_MIN_ELEMS = 1 << 20
+
+
+def _fused_sparse_scores_supported(
+    q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
+) -> bool:
+    """The fused scorer keeps the head sum in fp32; it needs the head-width GEMM
+    shape it was written for, and enough work to beat the launch."""
+    return (
+        _fused_dsv41_kernels(q)
+        and q.dim() == 3
+        and k.dim() == 2
+        and q.shape[2] == k.shape[1]
+        and q.shape[2] % 16 == 0
+        and q.shape[2] >= 16
+        and weights.shape == (q.shape[0], q.shape[1])
+        and q.dtype in (torch.bfloat16, torch.float16)
+        and k.dtype == q.dtype
+        and weights.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and q.shape[0] * k.shape[0] >= _FUSED_SCORES_MIN_ELEMS
+    )
 
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
@@ -295,6 +321,8 @@ class DeepseekV41Indexer(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
         """q [t, H, d], k [n, d], weights [t, H] -> [t, n], summed over all heads."""
+        if _fused_sparse_scores_supported(q, k, weights):
+            return sparse_scores(q, k, weights)
         s = torch.einsum("bhd,nd->bhn", q, k)
         s = (s.relu() * weights.unsqueeze(-1)).sum(dim=1)
         return s.float()

@@ -322,6 +322,7 @@ one. `hc_mix_stats` then got its own SM80 schedule. Cumulative, on the same prom
 | + `hc_mix_stats` SM80 schedule | 0.4055 s | 9,598 |
 | + single-pass sparse MLA | 0.3580 s | 10,841 |
 | + `wo_a` matmul for G == 1, no-op output fill | 0.3490 s | 11,127 |
+| + fused relu-MQA scorer | 0.3450 s | 11,287 |
 
 Measure the first request twice before believing any of these: the first
 requests after a launch still pay Triton JIT for the new specializations, and
@@ -428,6 +429,16 @@ Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
 1. Fewer Python ops per layer. The three-step trace logs 875,920
    `python_function` and 58,222 `cpu_op` events, ~485 CPU ops per layer, all
    issued from one saturated thread per rank.
+
+   The indexer is not one of the fat ones. Its scorer
+   (`dsv41_sparse.scores`, `einsum("bhd,nd->bhn")` then relu, weight, head sum)
+   materialises `[tokens, heads, candidates]` — 0.48 GiB at a 4k prefill — and
+   is 3.2 ms per call in isolation, but the whole low-ratio scoring path is
+   only ~4 ms of a 358 ms step: fusing it (`kernels/ops/attention/dsv4/
+   sparse_scores.py`, one `tl.dot` per head with the head sum in fp32) is 4.5x
+   faster and far more accurate (2.8e-6 against an fp32 reference where the
+   bf16 einsum is at 3.7e-2, with 99.8% top-512 overlap on the selection), and
+   moves TTFT by 4 ms. Worth having, not where the step goes.
 2. Prefill CUDA graphs, the flag-level version of (1).
    `--cuda-graph-backend-prefill full` is not wired for this attention backend:
    `deepseek_v4_backend._GraphBucket.of` has `DECODE_OR_IDLE`, `TARGET_VERIFY`
