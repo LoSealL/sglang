@@ -558,6 +558,10 @@ def _apply_wo_a_bf16_matmul(
                 "falling back to einsum for the rest of this process: %s",
                 err,
             )
+    if o.shape[1] == 1:
+        # G == 1: the einsum's batch and permutation machinery buys nothing over
+        # a plain matmul here, and it enqueues in less than half the time.
+        return torch.mm(o.squeeze(1), wo_a.squeeze(0).t()).unsqueeze(1)
     return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
@@ -705,9 +709,7 @@ def _fp8_wo_a_einsum(
     recipe: Tuple[int, int, int],
 ) -> torch.Tensor:
     if get_platform().is_sm80:
-        return _fp8_wo_a_einsum_bf16_fallback(
-            o_fp8, o_s, weight, weight_scale, recipe
-        )
+        return _fp8_wo_a_einsum_bf16_fallback(o_fp8, o_s, weight, weight_scale, recipe)
 
     import deep_gemm
 

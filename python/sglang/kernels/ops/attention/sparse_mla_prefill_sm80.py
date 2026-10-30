@@ -245,7 +245,9 @@ def flash_mla_sparse_prefill_triton(
     flat_indices = indices.reshape(num_tokens, -1).contiguous()
     topk = flat_indices.shape[1]
 
-    out = torch.zeros(
+    # The store below writes every element: DV == D leaves the full head width
+    # in range, and the grid covers every head. Zero-filling first is pure cost.
+    out = torch.empty(
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
     )
 

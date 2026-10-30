@@ -321,6 +321,7 @@ one. `hc_mix_stats` then got its own SM80 schedule. Cumulative, on the same prom
 | Portable kernel, tiles for 8 heads | 0.4235 s | 9,171 |
 | + `hc_mix_stats` SM80 schedule | 0.4055 s | 9,598 |
 | + single-pass sparse MLA | 0.3580 s | 10,841 |
+| + `wo_a` matmul for G == 1, no-op output fill | 0.3490 s | 11,127 |
 
 Measure the first request twice before believing any of these: the first
 requests after a launch still pay Triton JIT for the new specializations, and
@@ -457,8 +458,26 @@ Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
    with `--cuda-graph-backend-prefill disabled`. A 2,048-token replay is no
    faster than an eager step of the same size, so `breakable` captures
    fragments and breaks around the rest, and the 120 ms is not in the part it
-   captures. The gain needs `full`, i.e. the missing `_GraphBucket.EXTEND`
-   branch and the `hoisted_req` / `hoisted_pos` population above.
+   captures.
+
+   `full` is not a wiring change here, and this is the finding that closes it
+   on Ampere. Everything that makes the V4.1 prefill capturable lives behind
+   `low_ratio_prefill_graph`, and that property requires
+   `has_dense_fp4_indexer() and is_sm100_or_newer()`:
+
+   ```python
+   return (bool(self.low_ratios) and has_dense_fp4_indexer()
+           and is_sm100_or_newer() and get_parallel().attn_cp_size == 1)
+   ```
+
+   On A100 it is False by construction, because the capturable variant rides on
+   DeepGEMM's fp4 MQA-logits indexer, which has no SM80 kernels -- the same
+   absence that forces the torch indexer and `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH`
+   here. That is why `breakable` fell through to the eager `token_req_indices`
+   branch instead of the hoisted one: the hoisted metadata (`low_ratio_req_indices`,
+   `_low_ratio_prefill_indexer_metadata`, `_prefill_graph_full_topk`) was never
+   built. So `full` needs a torch-indexer port of that metadata and top-k, whose
+   shapes are data-dependent -- a feature, not a flag.
 
 3. Two-batch overlap is what the 28% row suggested, and it would overlap the
    collectives with compute — but there is nothing to overlap. It is also
