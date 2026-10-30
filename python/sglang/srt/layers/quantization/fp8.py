@@ -77,7 +77,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    marlin_fp8_shape_ok,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
@@ -187,6 +190,45 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 _DENSE_MXSCALE_LOGGED: set = set()
+
+# Thread-tile constraint from gptq_marlin.cuh: is_valid_config() needs a tile
+# (thread_k, thread_n) that divides both prob_k and prob_n, and the tables only
+# offer 128/64 for K and 256/128/64 for N with min 64 for each. Shapes that miss
+# this never select a kernel and fail with "Invalid thread config ... thread_k =
+# -1" at launch time.
+_MARLIN_MIN_THREAD_N = 64
+
+
+def _marlin_can_cover(layer: torch.nn.Module) -> bool:
+    """Whether ``gptq_marlin_gemm`` can pick a thread tile for this layer.
+
+    Marlin's FP8 auto-enable is a device-level decision, but the kernel also
+    needs both K and N divisible by one of its thread tiles. Tensor-parallel
+    partitions can violate that (DeepSeek-V4's shared expert with
+    intermediate_size 2304 split 8 ways gives N = 288 for w1/w3 and K = 288 for
+    w2), so fall back to the dequantizing path for those layers rather than
+    repacking into a layout the kernel cannot consume.
+    """
+    # Read the extents off the stored fp8 weight: those are the exact K and N
+    # that prepare_fp8_layer_for_marlin will repack and hand to the kernel.
+    # Derived attributes such as ``output_size_per_partition`` describe the
+    # fused layer and can disagree with the per-shard weight (DeepSeek-V4's
+    # fused gate_up_proj reports 576 while each shard is 288).
+    weight = getattr(layer, "weight", None)
+    if weight is not None and weight.dim() == 2:
+        cfg_block = getattr(
+            getattr(layer, "quant_method", None), "weight_block_size", None
+        )
+        # Per-tensor fp8 stores (K, N); block-quantized stores (N, K).
+        if cfg_block is None:
+            size_k, size_n = weight.shape[0], weight.shape[1]
+        else:
+            size_n, size_k = weight.shape[0], weight.shape[1]
+        return marlin_fp8_shape_ok(size_n, size_k)
+    size_n = getattr(layer, "output_size_per_partition", None)
+    if size_n is None:
+        return True
+    return size_n % _MARLIN_MIN_THREAD_N == 0
 
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
@@ -1246,12 +1288,60 @@ class Fp8LinearMethod(LinearMethodBase):
                 _amx_process_weight_after_loading(layer, ["weight"])
                 return
 
-        if self.use_marlin:
+        if self.use_marlin and _marlin_can_cover(layer):
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
+        elif self.use_marlin:
+            # This layer's partition is too narrow for the Marlin thread
+            # tiles, so leave the fp8 weight in place and let apply() take
+            # the dequantizing fallback instead of repacking a weight that
+            # no Marlin kernel can process.
+            logger.warning(
+                f"Skipping Marlin for fp8 layer {getattr(layer, 'prefix', '?')} "
+                f"(N={layer.weight.shape[-1]}, K={layer.weight.shape[0]}): "
+                f"Marlin needs an output width divisible by "
+                f"{_MARLIN_MIN_THREAD_N}. Dequantizing instead."
+            )
+
+    def _needs_bf16_dequant_fallback(self, layer: torch.nn.Module) -> bool:
+        """Whether this block-quantized layer must run as a dequantized bf16 GEMM.
+
+        True on devices without fp8 hardware when the shape is outside Marlin's
+        thread tiles. ``process_weights_after_loading`` leaves such a layer
+        unrepaacked (no ``workspace``), and no other fp8 kernel compiles without
+        a native ``fp8e4nv`` type.
+        """
+        return _is_cuda and not hasattr(layer, "workspace") and get_platform().is_sm80
+
+    def _block_fp8_bf16_linear(
+        self,
+        x: torch.Tensor,
+        layer: torch.nn.Module,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Block-scaled fp8 linear via a cached bf16 weight and plain matmul."""
+        weight_bf16 = getattr(layer, "_block_fp8_bf16_weight", None)
+        if weight_bf16 is None:
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            weight_bf16 = block_quant_dequant(
+                layer.weight,
+                layer.weight_scale_inv,
+                self.weight_block_size,
+                torch.bfloat16,
+            )
+            # The dequantized copy is a derived buffer, not a parameter, so it
+            # is skipped by the state dict while still living on the device.
+            layer.register_buffer(
+                "_block_fp8_bf16_weight", weight_bf16, persistent=False
+            )
+        out = torch.matmul(x.to(weight_bf16.dtype), weight_bf16.t())
+        if bias is not None:
+            out = out + bias
+        return out
 
     def apply(
         self,
@@ -1259,7 +1349,19 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.use_marlin:
+        # The workspace attribute only exists once the weight has actually been
+        # repacked for Marlin (see process_weights_after_loading), so its
+        # presence is the authoritative signal that this layer can run Marlin.
+        # Guard on both extents anyway: Marlin needs K and N each divisible by
+        # a thread tile, and a TP shard can miss that even when the fused layer
+        # signature looks fine.
+        if (
+            self.use_marlin
+            and hasattr(layer, "workspace")
+            and marlin_fp8_shape_ok(
+                layer.output_size_per_partition, layer.input_size_per_partition
+            )
+        ):
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
@@ -1343,6 +1445,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     x.dtype,
                     True,  # is_vnni
                 )
+
+            # SM80 has no fp8 tensor cores and no fp8e4nv Triton type, so every
+            # fp8 matmul kernel (Marlin, deep_gemm, triton w8a8) is unavailable
+            # for shapes Marlin cannot tile. Dequantize the block-scaled weight
+            # once and run bf16 matmul; only reachable for the small TP shards
+            # that Marlin rejects (DeepSeek-V4's shared expert at TP8).
+            if self._needs_bf16_dequant_fallback(layer):
+                return self._block_fp8_bf16_linear(x, layer, bias)
 
             cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
             extra_kwargs = (

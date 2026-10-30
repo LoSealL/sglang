@@ -26,6 +26,13 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
     """
     expert_map = getattr(layer.dispatcher, "local_expert_mapping", None)
     global_num_experts = layer.dispatcher.num_experts if expert_map is not None else -1
+
+    # No global_scale for MXFP4 MoE. The MoE template's E8M0 scale path
+    # (dequant_fp8_scales<..., kFE8M0fnu>) already rebases the exponent and
+    # converts 2^(v-127) correctly, and moe_wna16_marlin.cuh only permits
+    # global_scale for nvfp4 (kFE2M1f with group_size 16). The dense Marlin
+    # kernel takes the other branch and does need the correction -- see
+    # marlin_utils_fp4.MXFP4_MARLIN_GLOBAL_SCALE_EXPONENT.
     return MarlinMoeQuantInfo(
         w13_qweight=layer.w13_weight,
         w2_qweight=layer.w2_weight,
@@ -37,6 +44,8 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
         is_k_full=True,
         w13_bias=getattr(layer, "w13_weight_bias", None),
         w2_bias=getattr(layer, "w2_weight_bias", None),
+        w13_global_scale=None,
+        w2_global_scale=None,
         expert_map=expert_map,
         global_num_experts=global_num_experts,
     )
@@ -148,8 +157,12 @@ class Mxfp4MarlinMoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if not get_platform().is_sm90 and not get_platform().is_sm120:
-            raise RuntimeError("MXFP4 Marlin requires SM90 or SM120.")
+        if (
+            not get_platform().is_sm90
+            and not get_platform().is_sm120
+            and not get_platform().is_sm80
+        ):
+            raise RuntimeError("MXFP4 Marlin requires SM80, SM90 or SM120.")
 
         if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
             raise RuntimeError(

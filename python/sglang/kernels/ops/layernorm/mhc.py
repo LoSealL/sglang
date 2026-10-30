@@ -1135,14 +1135,25 @@ def mhc_pre(
     else:
         if num_tokens <= 2048:
             assert n_splits == 1
-            if hc_hidden_size == 16384:
+            # hidden_block must divide BOTH hc_hidden_size (the row length) and
+            # split_size (the per-split slice), which is what the kernel
+            # factory asserts. Checking split_size is what makes this pick 128
+            # for sizes like 28672 and 20480 (split_size 896 / 640: not
+            # divisible by 256) while keeping 256 elsewhere.
+            #
+            # The previous hardcoded {16384: 256, 28672: 128} whitelist
+            # rejected DeepSeek-V4.1-Flash, whose hc_hidden_size is
+            # 20480 (= 5120 * 4); 128 is a valid tile for it.
+            split_size = hc_hidden_size // n_splits_pre
+            if hc_hidden_size % 256 == 0 and split_size % 256 == 0:
                 hidden_block = 256
-            elif hc_hidden_size == 28672:
+            elif hc_hidden_size % 128 == 0 and split_size % 128 == 0:
                 hidden_block = 128
             else:
                 raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                    f"got {hc_hidden_size}"
+                    f"mhc_pre splitk kernel requires hc_hidden_size "
+                    f"({hc_hidden_size}) and its per-split slice "
+                    f"({split_size}) to divide by 128 or 256"
                 )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
                 hc_mult3,

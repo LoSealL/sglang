@@ -11,6 +11,22 @@ from sglang.srt.utils import is_gfx95_supported
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
+
+def _fp8_triton_typing_unsupported() -> bool:
+    """True when Triton cannot compile ``fp8e4nv`` for this device.
+
+    Ampere (SM80/SM86) has no FP8 tensor cores, and its Triton backend only
+    knows ``fp8e4b15``/``fp8e5``, so binding a ``float8_e4m3fn`` pointer into a
+    kernel fails with "type fp8e4nv not supported in this architecture".
+    Those devices read the same bytes as ``uint8`` and decode E4M3 by hand.
+    """
+    if is_hip_runtime():
+        return False
+    arch = get_jit_cuda_arch()
+    major, minor = arch.major, arch.minor
+    # AdaLovelace (8.9) and Hopper (9.x) onward support native fp8e4nv.
+    return major < 8 or (major == 8 and minor < 9)
+
 # v4 KV cache layout (see kvcache.dsv4_main_kv_store._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
 #              7 ue8m0 scales padded to 8 bytes.
@@ -61,9 +77,13 @@ def dequantize_k_cache_paged_dsv4(
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
     # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
-    buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
+    buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
+    # Triton resolves the dtype of every kernel argument when it builds the
+    # signature, even for a branch that is dead at compile time. On devices
+    # without native fp8e4nv, passing a float8_e4m3fn pointer fails before the
+    # BYTEWISE_FP8 branch can be taken, so bind the same bytes as uint8 there.
+    buf_fp8 = buf_uint8 if _fp8_triton_typing_unsupported() else quant_k_cache_u8.view(fp8_dtype).reshape(-1)
 
     if out is None:
         out = torch.empty(
@@ -91,6 +111,7 @@ def dequantize_k_cache_paged_dsv4(
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
+        BYTEWISE_FP8=_fp8_triton_typing_unsupported(),
     )
     return out
 
@@ -190,7 +211,15 @@ def gather_dequant_requant_fp8_paged_dsv4(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    # Triton resolves the dtype of every kernel argument when it builds the
+    # signature, even for a branch that is dead at compile time. On devices
+    # without native fp8e4nv, passing a float8_e4m3fn pointer fails before the
+    # BYTEWISE_FP8 branch can be taken, so bind the same bytes as uint8 there.
+    buf_fp8 = (
+        buf_uint8
+        if _fp8_triton_typing_unsupported()
+        else quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    )
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
 
@@ -225,8 +254,36 @@ def gather_dequant_requant_fp8_paged_dsv4(
         NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
         PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
         S_OFFSET_BYTES=s_offset_bytes,
+        BYTEWISE_FP8=_fp8_triton_typing_unsupported(),
     )
     return out
+
+
+@triton.jit
+def _e4m3_byte_to_fp32(b):
+    """Decode one ``float8_e4m3fn`` byte (as uint8) to fp32.
+
+    Mirrors the OCP E4M3 spec Triton's ``fp8e4nv`` implements: sign bit 7,
+    4-bit exponent biased by 7, 3-bit mantissa; exponent 0 is denormal and
+    ``0x7F``/``0xFF`` are NaN (there is no infinity). Saturation is not needed
+    here because the KV cache stores finite quantized values.
+    """
+    b = b.to(tl.int32) & 0xFF
+    sign = (b & 0x80) << 24
+    exp = (b >> 3) & 0x0F
+    man = b & 0x07
+
+    # Normal: exponent rebias 7 -> 127 (add 120) and place the mantissa.
+    normal = ((exp + 120) << 23) | (man << 20)
+    # Denormal: value = man * 2^-9. Build it as a float multiply instead of
+    # a bit pattern to keep the kernel simple.
+    denormal = man.to(tl.float32) * (2.0**-9)
+    val = tl.where(
+        exp == 0,
+        denormal,
+        normal.to(tl.float32, bitcast=True),
+    )
+    return tl.where(sign != 0, -val, val)
 
 
 @triton.jit
@@ -246,6 +303,7 @@ def _dequantize_k_cache_paged_kernel(
     NOPE_ROPE_BYTES: tl.constexpr,
     PADDED_SCALE_PER_TOKEN: tl.constexpr,
     S_OFFSET_BYTES: tl.constexpr,
+    BYTEWISE_FP8: tl.constexpr = False,
 ):
     # One program per token: load page_table[token_id] once and emit all
     # NUM_SCALE_TILES nope tiles + rope tail via tl.static_range.
@@ -263,7 +321,10 @@ def _dequantize_k_cache_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        if BYTEWISE_FP8:
+            fp8_vals = _e4m3_byte_to_fp32(tl.load(buf_uint8_ptr + fp8_off))
+        else:
+            fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
@@ -423,7 +484,10 @@ def _gather_dequant_requant_fp8_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        if BYTEWISE_FP8:
+            fp8_vals = _e4m3_byte_to_fp32(tl.load(buf_uint8_ptr + fp8_off))
+        else:
+            fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))

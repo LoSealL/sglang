@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from typing import (
+    Any,
     FrozenSet,
     List,
     Literal,
@@ -44,6 +45,28 @@ from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
 logger = logging.getLogger(__name__)
+
+
+def pd_page_signature(pool: Any) -> str:
+    """``<layout>@<page tokens>:<bytes per page>`` for one KV pool.
+
+    The layout name alone cannot decide PD compatibility: a token's byte offset
+    depends on how many rows a page holds and how far apart the pages sit, and
+    neither is implied by the name.
+    """
+    layout = getattr(pool, "kv_layout", None)
+    name = layout.value if layout is not None else "?"
+    page_size = getattr(pool, "page_size", None)
+    if page_size is None:
+        return name
+    # The stride is a pure function of (layout, page_size), so a pool that keeps
+    # it implicit (the unified ring) can still report it.
+    page_bytes = getattr(pool, "bytes_per_page_padded", None)
+    if page_bytes is None and layout is not None:
+        page_bytes = layout.page_bytes(page_size)
+    if page_bytes is None:
+        return f"{name}@{page_size}"
+    return f"{name}@{page_size}:{page_bytes}"
 
 _is_hip = is_hip()
 
@@ -1689,14 +1712,36 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return layout
 
     def pd_kv_layout(self) -> str:
-        """The main and compressed KV layouts, which PD peers must share."""
-        if self.uniform_fp8:
-            return KVLayout.UNIFORM_FP8.value
-        compressed = [
-            f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
-            for ratio in sorted(set(self.compression_ratios) - {0})
-        ]
-        return ",".join([self.kv_layout.value, *compressed])
+        """The KV byte layout PD peers must share, per pool.
+
+        Every component that moves over PD is published as whole pages plus a
+        page index, so the receiver reconstructs a token's address from the page
+        size and the per-page stride. Two nodes can agree on the layout *name*
+        and still disagree on those two numbers -- a different
+        ``--page-size``, or the SM120 direct-SWA mode that stores 256-token
+        logical pages as 64-token physical rows -- and then every page after the
+        first decodes from some other page's bytes. Encoding the numbers here
+        turns that silent corruption into a handshake error.
+        """
+        main_layout = (
+            KVLayout.UNIFORM_FP8 if self.uniform_fp8 else self.kv_layout
+        )
+        # The main cache is the SWA pool; the descriptor follows whichever
+        # object actually owns the transferred rows.
+        swa_pool = (
+            self.swa_kv_pool if self.swa_kv_pool is not None else self.unified_kv_pool
+        )
+        if swa_pool is None:
+            # Request-window mode keeps the ring inside per-request state.
+            parts = [main_layout.value, "swa=request_window"]
+        else:
+            parts = [main_layout.value, f"swa={pd_page_signature(swa_pool)}"]
+
+        for ratio in sorted(set(self.compression_ratios) - {0}):
+            pool = self.kv_pools.get(ratio)
+            if pool is not None:
+                parts.append(f"c{ratio}={pd_page_signature(pool)}")
+        return ";".join(parts)
 
     def _make_indexer_pool(
         self,

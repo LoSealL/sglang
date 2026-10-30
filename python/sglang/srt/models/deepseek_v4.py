@@ -658,6 +658,45 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
+def _fp8_wo_a_einsum_bf16_fallback(
+    o_fp8: torch.Tensor,
+    o_s: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    recipe: Tuple[int, int, int],
+) -> torch.Tensor:
+    """Block-dequantized bf16 stand-in for :func:`_fp8_wo_a_einsum`.
+
+    ``deep_gemm.fp8_einsum`` is the production grouped FP8 contraction, but
+    DeepGEMM only targets SM90+ : on Ampere it either asserts or silently
+    produces wrong tiles. Both operands here use the DSv4 ``(1, 1, 128)`` /
+    ``(1, 128, 128)`` block recipes, i.e. a scale per ``(row, k//128)`` group,
+    so we can dequantize to bf16 and run the same grouped contraction with
+    plain ``torch.bmm``. That costs 2x the FLOPs versus fp8 tensor cores -- an
+    accepted trade on hardware that has no fp8 MMA at all.
+    """
+    groups, rank = weight.shape[:2]
+    num_tokens = o_fp8.shape[0]
+
+    # Activations: o_fp8 [T, G, D] with o_s [T, G, D // 128].
+    act = o_fp8.to(torch.bfloat16).reshape(num_tokens, groups, -1)
+    a_s = o_s.reshape(num_tokens, groups, -1).to(torch.float32)
+    group_k = act.shape[-1] // a_s.shape[-1]
+    act = act.reshape(num_tokens, groups, -1, group_k) * a_s.unsqueeze(-1)
+    act = act.reshape(num_tokens, groups, -1)
+
+    # Weights: [G, R, D] fp8 with [G, R, D // 128] scales.
+    w = weight.to(torch.bfloat16).reshape(groups, rank, -1)
+    w_s = weight_scale.reshape(groups, rank, -1).to(torch.float32)
+    w_group_k = w.shape[-1] // w_s.shape[-1]
+    w = w.reshape(groups, rank, -1, w_group_k) * w_s.unsqueeze(-1)
+    w = w.reshape(groups, rank, -1)
+
+    # [G, T, D] @ [G, D, R] -> [G, T, R] -> [T, G, R]
+    out = torch.bmm(act.transpose(0, 1), w.transpose(1, 2))
+    return out.transpose(0, 1).contiguous()
+
+
 def _fp8_wo_a_einsum(
     o_fp8: torch.Tensor,
     o_s: torch.Tensor,
@@ -665,6 +704,11 @@ def _fp8_wo_a_einsum(
     weight_scale: torch.Tensor,
     recipe: Tuple[int, int, int],
 ) -> torch.Tensor:
+    if get_platform().is_sm80:
+        return _fp8_wo_a_einsum_bf16_fallback(
+            o_fp8, o_s, weight, weight_scale, recipe
+        )
+
     import deep_gemm
 
     groups, rank = weight.shape[:2]

@@ -1080,8 +1080,15 @@ __global__ void Marlin(
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
-      dequant_fp8_scales<scalar_t2>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-      dequant_fp8_scales<scalar_t2>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+      // FP4 weights carry E8M0 (ue8m0) block scales, not E4M3. Dispatching to
+      // the s_type_id overload is what makes that distinction: the untyped
+      // overload below decodes the byte as an E4M3 value, which for an E8M0
+      // scale such as 127 (=2^0) yields ~3.6e-34 and collapses every
+      // activation to zero. keep this on the typed overload.
+      dequant_fp8_scales<scalar_t2, host::kFE8M0fnu.id()>(
+          s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+      dequant_fp8_scales<scalar_t2, host::kFE8M0fnu.id()>(
+          s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
     }
 
 // We have the m dimension as the inner loop in order to encourage overlapping

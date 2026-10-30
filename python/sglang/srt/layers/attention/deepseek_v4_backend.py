@@ -1184,6 +1184,33 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
+def _paged_byte_rows(cache: torch.Tensor) -> torch.Tensor:
+    """``(pages, page_bytes)`` row view of a paged KV cache, page stride intact.
+
+    ``dequantize_k_cache_paged_dsv4`` takes the page stride from ``shape[-1]``,
+    so it needs one row per page rather than the
+    ``(pages, page_size, 1, bytes_per_token)`` view the FlashMLA kernels detect
+    the layout from.
+
+    The stride is ``cache.stride(0)``, the same rule the FlashMLA decode path
+    uses (``flash_mla_sm120`` reads ``k_cache.stride(0)``). Keeping the pool's
+    real page stride puts this reader on exactly the byte addressing the
+    Hopper/Blackwell kernels use on the same pages, and it is the stride PD
+    transfers page by page. Slicing down to the live span instead would rebase
+    page N at ``N * page_size * bytes_per_token``; where the pool pads a page
+    (``KVLayout.V4`` pads to 576) that lands in another page's bytes.
+    """
+    page_bytes = cache.stride(0)
+    pages = cache.shape[0]
+    needed = cache.storage_offset() + pages * page_bytes
+    available = cache.untyped_storage().nbytes()
+    assert needed <= available, (
+        f"page stride {page_bytes} over {pages} pages needs {needed} bytes, "
+        f"but the storage holds {available}"
+    )
+    return cache.as_strided((pages, page_bytes), (page_bytes, 1))
+
+
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
@@ -1329,6 +1356,9 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        # Sparse decode on GPUs without a FlashMLA image dequantizes the
+        # selected slots into this buffer; same lifetime rules as prefill's.
+        self.sparse_decode_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -4179,6 +4209,27 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )[0]
+            elif get_platform().is_sm80:
+                # flash_mla_with_kvcache ships sm_90a/sm_100 images only and its
+                # sparse decode raises "Unsupported architecture" on Ampere.
+                # Dequantize the paged fp8 cache into a bf16 workspace and run
+                # the portable Triton sparse-MLA kernel instead.
+                o = self._forward_decode_sparse_sm80(
+                    q=q,
+                    layer_id=layer_id,
+                    compress_ratio=compress_ratio,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                    token_to_kv_pool=token_to_kv_pool,
+                    positions=match_num_queries(
+                        core_attn_metadata.positions, value=0
+                    ),
+                )
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
@@ -4229,7 +4280,15 @@ class DeepseekV4AttnBackend(
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Gathers each request's SWA window and c4/c128 cache into a flat bf16
         workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
-        if _is_xpu:
+        # flashmla_ops only ships sm_90a/sm_100 images and the kernel itself
+        # relies on TMA + wgmma, so on SM80 (A100) there is nothing to call.
+        # Fall back to the portable Triton sparse-MLA prefill, which consumes
+        # the identical (q, kv, indices, topk_length) contract.
+        if get_platform().is_sm80:
+            from sglang.kernels.ops.attention.sparse_mla_prefill_sm80 import (
+                flash_mla_sparse_prefill_triton as flash_mla_sparse_fwd,
+            )
+        elif _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
         else:
             from sgl_kernel.flash_mla import flash_mla_sparse_fwd
@@ -4286,6 +4345,14 @@ class DeepseekV4AttnBackend(
         kv = workspace
 
         if cos_sin_cache is not None:
+            if get_platform().is_sm80:
+                # The mega (fused RoPE) prefill is a FlashMLA-backed SM90 path;
+                # this class has no implementation of it on Ampere.
+                raise ValueError(
+                    "DeepSeek-V4 mega prefill requires SM90+ CUDA GPUs; "
+                    "on SM80 use --dsv4-attn-backend flashmla with "
+                    "--dsv4-prefill-backend flashmla_sparse."
+                )
             return self._forward_mega_prefill(
                 q=q_flat,
                 kv=kv,
@@ -4306,6 +4373,200 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
         return o
+
+    def _forward_decode_sparse_sm80(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        compress_ratio: Literal[0, 1, 2, 4, 128],
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: Optional[torch.Tensor],
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        attn_sink: torch.Tensor,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sparse MLA decode for GPUs the FlashMLA decode kernel cannot target.
+
+        ``flash_mla_with_kvcache`` only ships sm_90a/sm_100 images, so Ampere
+        cards raise "Unsupported architecture for sparse decode fwd". This path
+        keeps the same paged fp8 KV layout and sparse index contract, reading
+        only the slots the indices select.
+        """
+        # q is (b, 1, h_q, d_qk); the decode helper takes (s_q, h_q, d_qk).
+        q_flat = q.squeeze(1)
+        num_q = q_flat.shape[0]
+
+        # An index is a flat slot in the paged cache; -1 marks an unused slot.
+        swa_idx = swa_page_indices.reshape(num_q, -1)
+        swa_valid = swa_idx >= 0
+
+        build_extra = extra_k_cache is not None and extra_indices is not None
+        extra_page_size = 0
+        extra_idx = extra_valid = None
+        if build_extra:
+            extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            extra_idx = extra_indices.reshape(num_q, -1)
+            extra_valid = extra_idx >= 0
+
+        # The caller hands over (pages, page_size, 1, bytes_per_token) views,
+        # which is what the FlashMLA kernels detect the layout from. The paged
+        # dequantizer wants one byte row per page instead, carrying the pool's
+        # own page stride so the A100 reader addresses the same bytes that the
+        # FlashMLA path (and a PD peer) does.
+        swa_k_cache = _paged_byte_rows(swa_k_cache)
+        if build_extra:
+            extra_k_cache = _paged_byte_rows(extra_k_cache)
+
+        from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+            dequantize_k_cache_paged_dsv4,
+        )
+        from sglang.kernels.ops.attention.sparse_mla_prefill_sm80 import (
+            flash_mla_sparse_prefill_triton,
+        )
+
+        # Dequantize only the union of referenced slots into one bf16
+        # workspace and run the portable Triton sparse-MLA kernel on it. The
+        # paged dequantizer is the primitive the SM90/SM120 paths share, and
+        # writing the two segments back-to-back gives the row order the kernel
+        # expects: SWA window first, compressed rows second.
+        swa_slots, swa_inv = torch.unique(
+            torch.where(swa_valid, swa_idx, 0).reshape(-1), return_inverse=True
+        )
+        n_swa = swa_slots.numel()
+        if build_extra:
+            extra_slots, extra_inv = torch.unique(
+                torch.where(extra_valid, extra_idx, 0).reshape(-1),
+                return_inverse=True,
+            )
+            n_extra = extra_slots.numel()
+        else:
+            n_extra = 0
+
+        workspace = self.sparse_decode_workspace.get(n_extra + n_swa)
+        dequantize_k_cache_paged_dsv4(
+            swa_k_cache,
+            swa_slots.to(torch.int32),
+            page_size=token_to_kv_pool.get_swa_key_page_size(),
+            out=workspace[:n_swa],
+            layout=token_to_kv_pool.get_swa_key_layout(),
+        )
+        if build_extra:
+            dequantize_k_cache_paged_dsv4(
+                extra_k_cache,
+                extra_slots.to(torch.int32),
+                page_size=extra_page_size,
+                out=workspace[n_swa:],
+                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+            )
+
+        # Rebase the per-query indices onto the workspace. Unused slots keep the
+        # -1 sentinel: the kernel drops them rather than reading slot 0, which
+        # holds decompressed-but-unreferenced data.
+        swa_remap = torch.where(
+            swa_valid, swa_inv.reshape(num_q, -1).to(torch.int32), -1
+        )
+        if build_extra:
+            extra_remap = torch.where(
+                extra_valid,
+                extra_inv.reshape(num_q, -1).to(torch.int32) + n_swa,
+                -1,
+            )
+            combined_idx = torch.cat([swa_remap, extra_remap], dim=1)
+            # Past the live prefix the compressed lanes hold stale indexer
+            # output rather than -1, so bound the row explicitly.
+            combined_len = (
+                torch.clamp(
+                    (positions + 1) // compress_ratio, max=extra_idx.shape[1]
+                ).to(torch.int32)
+                + swa_idx.shape[1]
+            )
+        else:
+            combined_idx = swa_remap
+            combined_len = None
+
+        o, _, _ = flash_mla_sparse_prefill_triton(
+            q=q_flat,
+            kv=workspace,
+            indices=combined_idx.unsqueeze(1),
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=combined_len,
+            prefix_length=None,
+        )
+        return o.unsqueeze(1)
+
+    def _sparse_mla_decode_torch(
+        self,
+        *,
+        q_flat: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_idx: torch.Tensor,
+        swa_valid: torch.Tensor,
+        swa_page_size: int,
+        extra_k_cache: Optional[torch.Tensor],
+        extra_idx: Optional[torch.Tensor],
+        extra_valid: Optional[torch.Tensor],
+        extra_page_size: int,
+        attn_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Sparse MLA decode in plain PyTorch for GPUs without a FlashMLA image.
+
+        Mirrors ``flash_mla_sm120._sm120_sparse_decode_fwd``: gather the selected
+        rows straight out of the paged byte caches, zero the invalid ones, and
+        run an explicit fp32 softmax with the attention sink folded into the
+        normalizer. Reading the cache directly keeps the page arithmetic in one
+        place and avoids a second copy of the dequantized KV.
+        """
+        from sglang.kernels.ops.attention.flash_mla_sm120 import (
+            _gather_and_dequant,
+        )
+
+        def gather(cache, idx, valid, page_size):
+            kv = _gather_and_dequant(cache, idx.unsqueeze(0), page_size)
+            kv = kv.reshape(idx.shape[0], idx.shape[1], kv.shape[-1])
+            return kv, valid
+
+        segs, masks = [], []
+        for cache, idx, valid, page_size in (
+            (swa_k_cache, swa_idx, swa_valid, swa_page_size),
+            (extra_k_cache, extra_idx, extra_valid, extra_page_size),
+        ):
+            if cache is None or idx is None:
+                continue
+            kv, m = gather(cache, idx, valid, page_size)
+            segs.append(kv)
+            masks.append(m)
+        kv_all = torch.cat(segs, dim=1)  # (num_q, topk, 512)
+        msk = torch.cat(masks, dim=1)  # (num_q, topk)
+
+        q_f = q_flat.to(torch.float32)
+        scores = torch.einsum("qhd,qtd->qht", q_f, kv_all.float())
+        scores = scores * self.softmax_scale
+        scores = scores.masked_fill(~msk[:, None, :], float("-inf"))
+
+        lse = torch.logsumexp(scores, dim=-1)
+        if attn_sink is not None:
+            sink = attn_sink.reshape(1, -1).to(torch.float32)
+            lse_out = torch.logsumexp(
+                torch.stack([lse, sink.expand_as(lse)], dim=0), dim=0
+            )
+        else:
+            lse_out = lse
+        # A row whose window is not written yet has no live slot at all; it must
+        # contribute zeros rather than NaN.
+        lonely = ~torch.isfinite(lse)
+        lse_out = torch.where(lonely, torch.zeros_like(lse_out), lse_out)
+        weights = torch.exp(scores - lse_out.unsqueeze(-1))
+        out = torch.einsum(
+            "qht,qtd->qhd", weights, kv_all.float()[..., : self.head_dim_v]
+        )
+        out = torch.where(lonely.unsqueeze(-1), torch.zeros_like(out), out)
+        return out.to(torch.bfloat16)
 
     def _prepare_q8kv8_q_and_sink(
         self,

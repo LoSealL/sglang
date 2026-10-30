@@ -10,8 +10,18 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    _e4m3_byte_to_fp32,
+    _fp8_triton_typing_unsupported,
+)
+
 # e8m0 has no zero: the exponent byte 0 encodes 2**-127.
 _E8M0_ZERO = 2.0**-127
+
+# Triton only knows fp8e4nv on Ada (8.9) and newer. On older parts (A100) the
+# bare dtype fails to compile before any branch runs, so read the same bytes
+# through a uint8 pointer and decode E4M3 by hand.
+_BYTEWISE_FP8 = _fp8_triton_typing_unsupported()
 
 
 @triton.jit
@@ -25,6 +35,7 @@ def _engram_gather_kernel(
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
+    BYTEWISE_FP8: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
@@ -32,10 +43,16 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-    s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+    s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+    if BYTEWISE_FP8:
+        w8 = w_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        vals = _e4m3_byte_to_fp32(
+            tl.load(w8 + local * DIM + offs, mask=owned, other=0)
+        )
+    else:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
     exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
         tl.int32
     )
@@ -81,5 +98,6 @@ def engram_gather(
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
+            BYTEWISE_FP8=_BYTEWISE_FP8,
         )
     return out

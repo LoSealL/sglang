@@ -9,7 +9,47 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    _fp8_triton_typing_unsupported,
+)
 from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_AMAX_FLOOR
+
+# Triton only knows fp8e4nv on Ada (8.9)+; older parts need the emulated cast.
+_BYTEWISE_FP8 = _fp8_triton_typing_unsupported()
+
+
+@triton.jit
+def _round_to_e4m3_fp32(x):
+    """Round ``x`` onto the E4M3 grid, returning fp32 with E4M3's rounding.
+
+    Equivalent to ``x.to(tl.float8e4nv).to(tl.float32)`` but usable where
+    Triton has no ``fp8e4nv`` type (pre-Ada GPUs). ``x`` must already be
+    clamped into E4M3's finite range [2**-9, 448].
+
+    E4M3 is a 4-bit exponent (bias 7) with 3 mantissa bits, and its subnormal
+    grid below 2**-6 is uniform at 2**-9. Both regions are "round to the
+    nearest multiple of the local step, ties to even", so this works in the
+    value domain: pick the step from the binade, quantize, then fix up a
+    rounding carry that pushes the result into the next binade.
+    """
+    x = tl.abs(x)
+    # Grid step is 2**(e - 3) for a value in binade [2**e, 2**(e+1)), i.e. three
+    # mantissa bits of headroom. Below 2**-6 the binade no longer narrows the
+    # step: E4M3's subnormals form one uniform grid at 2**-9, so the step
+    # exponent is clamped there (fp32 field for 2**-9 is 127 - 9 = 118, and the
+    # step itself is that exponent minus 3).
+    bits = x.to(tl.int32, bitcast=True)
+    expo = tl.maximum((bits >> 23) & 0xFF, 118 + 3)  # 2**-6 -> step 2**-9
+    step = ((expo - 3) << 23).to(tl.float32, bitcast=True)
+
+    q = x / step
+    # Round half to even: nudge to an integer, then pull back the odd results
+    # that sat exactly on a half-way point.
+    up = (q + 0.5).to(tl.int32).to(tl.float32)
+    is_odd = (up.to(tl.int32) & 1) != 0
+    tie = (q - up + 0.5) == 0.0
+    up = up - (is_odd & tie).to(tl.float32)
+    return up * step
 
 
 @triton.jit
@@ -22,6 +62,7 @@ def rope_tail_fake_quant_fp4_row(
     AMAX_FLOOR: tl.constexpr,
     INVERSE: tl.constexpr,
     COMPRESSED_KV: tl.constexpr,
+    BYTEWISE_FP8: tl.constexpr,
 ):
     """One row of rope_tail_fake_quant_fp4 as an fp32 [D] vector: x_row_ptr points
     at the row, f_row_ptr at the token's [RD // 2, 2] real view of the complex freqs."""
@@ -54,7 +95,13 @@ def rope_tail_fake_quant_fp4_row(
     amax = tl.max(tl.abs(vb), axis=1)
     if COMPRESSED_KV:
         scale = tl.minimum(tl.maximum(amax * (1.0 / 6.0), 2.0**-9), 448.0)
-        scale = scale.to(tl.float8e4nv).to(tl.float32)
+        # Cast to E4M3 and back to reproduce the quantized scale exactly. The
+        # emulated path is bit-identical to the native cast (see
+        # _round_to_e4m3_fp32) and works on GPUs without an fp8e4nv type.
+        if BYTEWISE_FP8:
+            scale = _round_to_e4m3_fp32(scale)
+        else:
+            scale = scale.to(tl.float8e4nv).to(tl.float32)
         s = tl.div_rn(vb, scale[:, None])
     else:
         amax = tl.maximum(amax, AMAX_FLOOR) * (1.0 / 6.0)
@@ -90,6 +137,7 @@ def _rope_tail_fake_quant_fp4_kernel(
     AMAX_FLOOR: tl.constexpr,
     INVERSE: tl.constexpr,
     COMPRESSED_KV: tl.constexpr,
+    BYTEWISE_FP8: tl.constexpr,
     HAS_POS: tl.constexpr,
 ):
     r = tl.program_id(0)
@@ -108,6 +156,7 @@ def _rope_tail_fake_quant_fp4_kernel(
         AMAX_FLOOR=AMAX_FLOOR,
         INVERSE=INVERSE,
         COMPRESSED_KV=COMPRESSED_KV,
+        BYTEWISE_FP8=BYTEWISE_FP8,
     )
     tl.store(
         out_ptr + r * out_stride_r + tl.arange(0, D), out.to(out_ptr.dtype.element_ty)
@@ -164,6 +213,7 @@ def rope_tail_fake_quant_fp4(
         AMAX_FLOOR=FP4_AMAX_FLOOR,
         INVERSE=inverse,
         COMPRESSED_KV=compressed_kv,
+        BYTEWISE_FP8=_BYTEWISE_FP8,
         HAS_POS=positions is not None,
         num_warps=4,
     )

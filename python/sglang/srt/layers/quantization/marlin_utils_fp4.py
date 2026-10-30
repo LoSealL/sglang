@@ -25,6 +25,29 @@ if _is_cuda:
 ScalarType, scalar_types = get_scalar_types()
 logger = logging.getLogger(__name__)
 
+# Global scale the Marlin FP4 kernel expects for MXFP4 (E8M0 block scales).
+#
+# The FP4 path runs through ``dequant<..., /*skip_flop=*/true>``, which keeps
+# the FP4 code in the low bits of the bf16 exponent instead of applying the
+# exponent bias itself. That leaves a net 2^-126 on every weight element, and
+# the E8M0 block scale carries its own 2^-7 relative to the bf16 encoding, so
+# the kernel multiplies the accumulator by 2^(126 - 7) = 2^119 to recover the
+# real value.
+#
+# Do not "round" this to 2^126: that over-scales by 2^7 and the intermediate
+# accumulator then exceeds the bf16 maximum (3.39e38) for realistic K, which
+# shows up as a ~100x error rather than an overflow warning.
+MXFP4_MARLIN_GLOBAL_SCALE_EXPONENT = 119
+
+
+def mxfp4_marlin_global_scale(
+    dtype: torch.dtype = torch.bfloat16, device: torch.device | str = "cuda"
+) -> torch.Tensor:
+    """Single-element global scale tensor for the Marlin MXFP4 kernel."""
+    return torch.tensor(
+        [2.0**MXFP4_MARLIN_GLOBAL_SCALE_EXPONENT], dtype=dtype, device=device
+    )
+
 
 def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     if not (marlin_scales >= 0).all():

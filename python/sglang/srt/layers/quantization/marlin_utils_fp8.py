@@ -24,6 +24,32 @@ ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
 
+# gptq_marlin.cuh's thread-config tables only contain thread_k / thread_n in
+# {128, 64} and {256, 128, 64}, and is_valid_config() rejects a tile unless it
+# divides both prob_k and prob_n. min_thread_k / min_thread_n are both 64, so
+# "K % 64 == 0 and N % 64 == 0" is exactly the set of shapes Marlin can run;
+# anything else ends in thread_k = -1 and a launch failure.
+_MARLIN_MIN_THREAD_N = 64
+_MARLIN_MIN_THREAD_K = 64
+
+
+def marlin_fp8_shape_ok(size_n: int, size_k: int) -> bool:
+    """Whether Marlin has a thread tile for this (N, K) pair."""
+    return (
+        size_n % _MARLIN_MIN_THREAD_N == 0 and size_k % _MARLIN_MIN_THREAD_K == 0
+    )
+
+
+def marlin_fp8_size_n_ok(size_n: int) -> bool:
+    """Backwards-compatible N-only check; prefer :func:`marlin_fp8_shape_ok`."""
+    return size_n % _MARLIN_MIN_THREAD_N == 0
+
+
+def RuntimeCheckMsg(cond: bool, msg: str) -> None:
+    """Tiny local assert-with-message used at kernel-selection boundaries."""
+    if not cond:
+        raise RuntimeError(msg)
+
 
 def fp8_fused_exponent_bias_into_scales(scales):
     fp8_exponent = 4
@@ -71,8 +97,21 @@ def apply_fp8_marlin_linear(
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
 
+    # gptq_marlin_gemm derives N from the packed weight
+    # (dim1 / tile_size * pack_factor) and requires a thread tile that divides
+    # both N and K, so check the packed width rather than the caller's size_n:
+    # fused/merged partitions can report a tiled width while each shard is
+    # narrower (DeepSeek-V4's shared expert w1/w3 are 288 at TP8).
+    packed_n = weight.shape[1] // 16 * 4
+    RuntimeCheckMsg(
+        marlin_fp8_shape_ok(packed_n, size_k),
+        f"Marlin has no thread tile for N={packed_n}, K={size_k} (both must be "
+        f"multiples of {_MARLIN_MIN_THREAD_N}); this layer must not be repacked "
+        f"for Marlin. See Fp8LinearMethod.process_weights_after_loading.",
+    )
+
     use_atomic_add = should_use_atomic_add_reduce(
-        m=reshaped_x.size(0), n=size_n, k=size_k, device=input.device, dtype=input.dtype
+        m=reshaped_x.size(0), n=packed_n, k=size_k, device=input.device, dtype=input.dtype
     )
 
     output = gptq_marlin_gemm(

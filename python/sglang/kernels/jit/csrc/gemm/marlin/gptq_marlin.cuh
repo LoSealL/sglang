@@ -291,7 +291,12 @@ bool is_valid_config(
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false)  \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false)
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 8, NUM_THREADS, false) \
+  /* m_block_size_8 variants: a split-K pass reduces a multi-row GEMM to \
+     single rows (e.g. M=193 split 192 ways), which lands on the M=1 x 8 \
+     template. Without these the whole call fails kernel selection. */     \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, true)    \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, true)
 
 #define COMMON_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
   _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, -1, NUM_THREADS, false) \
@@ -339,14 +344,25 @@ bool is_valid_config(
   BIGGROUP_GET_IF_M234(W_TYPE, 8, 4, 128)  \
   BIGGROUP_GET_IF_M234(W_TYPE, 4, 8, 128)
 
+// GROUP_BLOCKS is group_size / 16, so MXFP4's standard group_size=32 needs 2
+// while the older group_size=16 checkpoints use 1. Both are instantiated: a
+// caller that only ever sees one of them pays nothing for the other, and a
+// checkpoint with the other group size no longer fails kernel selection with
+// "Invalid thread config: thread_k = -1" (get_marlin_kernel returns
+// MarlinDefault for every unregistered combination).
 #define FP4_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)        \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
 
 #define FP4_GET_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
   _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
   _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
-  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false)
+  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 1, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
 
 #define FP4_GET_IF(W_TYPE)            \
   FP4_GET_IF_M1(W_TYPE, 8, 8, 256)    \
@@ -416,6 +432,12 @@ MarlinFuncPtr get_marlin_kernel(
   FP4_GET_IF(host::kFE2M1f)
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
+  // FP8 weights also appear with group_size 32 (group_blocks = 2), e.g.
+  // DeepSeek-V4's 32x32 block-scaled linears. BIGGROUP_GET_IF only registers
+  // group_blocks -1 and 8 (group_size 1 and 128), so those calls failed kernel
+  // selection with "thread_k = -1" -- which is what A100 hits, because
+  // can_auto_enable_marlin_fp8() routes fp8 dense GEMMs there for SM80/86.
+  COMMON_GET_IF(host::kFE4M3fn)
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)

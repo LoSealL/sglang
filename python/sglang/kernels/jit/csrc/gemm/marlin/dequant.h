@@ -501,6 +501,29 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, host::kFE8M0fnu.id()>(in
   frag_b[0] = *reinterpret_cast<const nv_bfloat162*>(&Out2);
 }
 
+template <>
+__device__ inline void dequant_fp8_scales<half2, host::kFE8M0fnu.id()>(int q, half2* frag_b) {
+  // E8M0 -> FP16. An E8M0 byte v encodes 2^(v-127); FP16 biases its 5-bit
+  // exponent at 15, so the exponent becomes v - 112. Unlike the bf16 case the
+  // 8-bit E8M0 range does not fit FP16's 5-bit exponent, so the result is
+  // clamped into the normal FP16 exponent range (the surrounding code
+  // upcasts fp16 activations to bf16 when a model actually carries E8M0
+  // scales, so this path only guards against a caller that does not).
+  constexpr int FP16_MIN_EXP = 1, FP16_MAX_EXP = 30;
+  auto expand = [](int byte) {
+    int e = byte - 112;
+    e = e < FP16_MIN_EXP ? FP16_MIN_EXP : (e > FP16_MAX_EXP ? FP16_MAX_EXP : e);
+    return static_cast<unsigned short>((e << 10) & 0x7C00);
+  };
+
+  int lo = (expand(q & 0xFF) & 0xFFFF) | (expand((q >> 8) & 0xFF) << 16);
+  int hi = (expand((q >> 16) & 0xFF) & 0xFFFF) | (expand((q >> 24) & 0xFF) << 16);
+
+  // Note: reverse indexing is intentional because weights are permuted
+  frag_b[1] = *reinterpret_cast<const half2*>(&lo);
+  frag_b[0] = *reinterpret_cast<const half2*>(&hi);
+}
+
 #endif
 
 }  // namespace device::marlin
