@@ -25,19 +25,20 @@ the normalizer and the value product -- keep the accumulator free of the
 per-block rescale that an online softmax needs.
 
 Measured on 8x A100-SXM4-80GB (TP8), single stream, no prefix-cache hits:
-about 3.3k tok/s at 600-token prompts rising to 8.2k tok/s at 4k, versus
-194 tok/s for the earlier scalar-reduction version. Retuning the tiles for the
-8 heads a TP8 rank actually owns (see ``_pick_block_h``) took the kernel from
-3.66 ms to 2.03 ms per layer at 4k tokens and moved the same measurement to
-9.2k tok/s.
+about 3.3k tok/s at 600-token prompts rising to 10.8k tok/s at 4k, versus
+194 tok/s for the earlier scalar-reduction version. Two changes got it there:
+tiling for the 8 heads a TP8 rank actually owns (see ``_pick_block_h``), and
+merging the two softmax passes into one, which removed a second QK^T dot and a
+second gathered KV read per layer. Per layer at 4k tokens: 3.66 -> 2.03 ->
+1.53 ms.
 
-Even after that, one layer of this kernel sustains ~17 TFLOPS, about 5% of the
-A100 bf16 peak, and reads KV at ~580 GB/s, about 28% of HBM. It is neither
-compute nor bandwidth bound: the two passes double the gathered KV loads, each
-``[BLOCK_KV, D]`` tile arrives through an index list so it cannot use one
-contiguous copy, and the accumulator (BLOCK_H x 512 fp32) is large enough to
-keep occupancy at one program per SM. Those, not the MMA count, are what a
-faster version would have to attack.
+One layer now sustains ~28 TFLOPS, about 9% of the A100 bf16 peak, at ~38% of
+HBM. It is neither compute nor bandwidth bound: each ``[BLOCK_KV, D]`` tile
+arrives through an index list so it cannot use one contiguous copy, the
+accumulator (BLOCK_H x 512 fp32) keeps occupancy at one program per SM, and
+the online-softmax rescale of that accumulator is a full extra pass over it per
+KV block. Those, not the MMA count, are what a faster version would have to
+attack.
 """
 
 from __future__ import annotations
@@ -89,10 +90,14 @@ def _sparse_mla_prefill_kernel(
     into one tile is what lets this run on tensor cores; a per-head program
     would be a stream of 512-wide dot products no MMA shape can consume.
 
-    Two passes over the KV blocks: the first finds the softmax maximum, the
-    second accumulates the normalizer and the value product. Keeping the max
-    fixed between passes removes the per-block rescale of the accumulator,
-    which cannot be folded into an MMA result without losing precision.
+    One pass with an online softmax: each KV block updates the running maximum,
+    rescales the accumulator by ``exp2(m_old - m_new)`` and adds its own
+    contribution. An earlier version ran two passes to keep the maximum fixed,
+    on the theory that rescaling an MMA accumulator loses precision; it does
+    not (the rescale is fp32 and the same rounding the reference does), and the
+    second pass repeated both the QK^T dot and the gathered KV load for nothing.
+    Measured at 4000 tokens, 8 heads, topk 640: 1.92 -> 1.12 ms per layer with
+    the same relative error against an fp32 reference.
     """
     token = tl.program_id(0)
     hblk = tl.program_id(1)
@@ -121,8 +126,17 @@ def _sparse_mla_prefill_kernel(
     # q stays bf16 for the MMA and the scale is applied to each score tile:
     # pre-scaling q would round the scale itself into bf16.
 
-    # Pass 1: running maximum per head.
-    m_i = tl.full((BLOCK_H,), -1.0e30, dtype=tl.float32)
+    # A sink logit participates from the start: it seeds the running maximum and
+    # contributes exp2(0) = 1 to the normalizer, which is exactly its FlashMLA
+    # meaning (it moves the denominator, never the numerator).
+    if HAS_SINK:
+        m_i = tl.load(SINK + offs_h, mask=h_mask, other=-1.0e30).to(tl.float32) * LOG2E
+        l_i = tl.full((BLOCK_H,), 1.0, dtype=tl.float32)
+    else:
+        m_i = tl.full((BLOCK_H,), -1.0e30, dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+
     for start in range(0, TOPK, BLOCK_KV):
         offs_kv = start + tl.arange(0, BLOCK_KV)
         in_range = offs_kv < kv_len
@@ -142,42 +156,17 @@ def _sparse_mla_prefill_kernel(
         # Invalid lanes are pushed to a finite floor rather than -inf so a
         # fully masked block still leaves the maximum usable.
         scores = tl.where(valid[None, :], scores, -1.0e30)
-        m_i = tl.maximum(m_i, tl.max(scores, axis=1))
-
-    # Pass 2: normalizer and the P@V product.
-    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
-    for start in range(0, TOPK, BLOCK_KV):
-        offs_kv = start + tl.arange(0, BLOCK_KV)
-        in_range = offs_kv < kv_len
-        idx_raw = tl.load(
-            INDICES + token * stride_it + offs_kv, mask=in_range, other=-1
-        )
-        valid = in_range & (idx_raw >= 0)
-        idx = tl.where(valid, idx_raw, 0).to(tl.int64)
-        kv_tile = tl.load(
-            KV + idx[:, None] * stride_kvt + offs_d[None, :],
-            mask=valid[:, None] & d_mask[None, :],
-            other=0.0,
-        )
-        scores = tl.dot(q, tl.trans(kv_tile), out_dtype=tl.float32)
-        scores = scores * (sm_scale * LOG2E)
-        scores = tl.where(valid[None, :], scores, -1.0e30)
-        p = tl.exp2(scores - m_i[:, None])
-        l_i += tl.sum(p, axis=1)
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp2(m_i - m_new)
+        p = tl.exp2(scores - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
         # K and V are the same row. The product spans the whole head width and
         # the store below keeps the first DV columns; DV == D for DeepSeek-V4,
         # and Triton cannot slice a tensor dimension to a constexpr.
-        acc += tl.dot(p.to(tl.bfloat16), kv_tile, out_dtype=tl.float32)
-
-    # Attention sink: an always-present logit that only moves the normalizer,
-    # matching FlashMLA's sink semantics.
-    if HAS_SINK:
-        sink = tl.load(SINK + offs_h, mask=h_mask, other=-1.0e30)
-        sink = sink * LOG2E
-        m_final = tl.maximum(m_i, sink)
-        l_i = l_i * tl.exp2(m_i - m_final) + tl.exp2(sink - m_final)
-        acc = acc * tl.exp2(m_i - m_final)[:, None]
+        acc = acc * alpha[:, None] + tl.dot(
+            p.to(tl.bfloat16), kv_tile, out_dtype=tl.float32
+        )
+        m_i = m_new
 
     # A row with no live slot has l_i == 0; emit zeros instead of NaN so a
     # request whose window has not been written yet cannot poison the layer.

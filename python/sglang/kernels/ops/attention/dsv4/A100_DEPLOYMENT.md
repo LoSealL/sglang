@@ -312,6 +312,20 @@ request hits the prefix cache:
 | ~2,850 | 194 | 7,600 tok/s |
 | ~4,050 | — | 8,240 tok/s |
 
+Two later changes took the 4k figure to 10,800 tok/s: tiling the sparse-MLA
+kernel for the 8 heads a TP8 rank owns, and merging its two softmax passes into
+one. `hc_mix_stats` then got its own SM80 schedule. Cumulative, on the same prompt:
+
+| Change | 3,884-token TTFT | tok/s |
+| --- | ---: | ---: |
+| Portable kernel, tiles for 8 heads | 0.4235 s | 9,171 |
+| + `hc_mix_stats` SM80 schedule | 0.4055 s | 9,598 |
+| + single-pass sparse MLA | 0.3580 s | 10,841 |
+
+Measure the first request twice before believing any of these: the first
+requests after a launch still pay Triton JIT for the new specializations, and
+they read 30-40% slow (5,393 tok/s where the warmed server gives 9,598).
+
 The absolute figures only hold with `#cached-token: 0`; repeated prompts reuse
 the prefix cache and inflate the number several-fold. Verify against the
 server's own `Prefill batch ... input throughput` line before quoting any
@@ -330,19 +344,19 @@ each part sustains against the A100-SXM4 bf16 peak of 312 TFLOPS.
 
 | Kernel group | GPU time | Share | FLOPs | Achieved |
 | --- | ---: | ---: | ---: | ---: |
-| `_sparse_mla_prefill_kernel` | 339 ms | 30% | 1.7 TFLOP | 15 TFLOPS (5% peak) |
-| TP all-reduce (`2shot_pull` + NCCL) | 208 ms | 19% | — | — |
-| MoE (`fused_marlin_moe`) | 127 ms | 11% | 8.5 TFLOP | 200 TFLOPS (64% peak) |
-| Dense fp8 Marlin (attention projections) | 106 ms | 9% | 5.3 TFLOP | 121 TFLOPS (39% peak) |
-| `hc_mix_stats` + `mhc_post` + combine | 142 ms | 13% | — | — |
-| Everything else (fill, wo_a bf16, top-k) | 90 ms | 8% | — | — |
+| `_sparse_mla_prefill_kernel` | 183 ms | 18% | 1.68 TFLOP | 28 TFLOPS (9% peak) |
+| TP all-reduce (`2shot_pull` + NCCL) | 282 ms | 28% | — | — |
+| MoE (`fused_marlin_moe`) | 127 ms | 13% | 8.5 TFLOP | 200 TFLOPS (64% peak) |
+| Dense fp8 Marlin (attention projections) | 106 ms | 11% | 5.3 TFLOP | 121 TFLOPS (39% peak) |
+| `hc_mix_stats` + `mhc_post` + combine | 109 ms | 11% | — | — |
+| Everything else (fill, wo_a bf16, top-k) | 90 ms | 9% | — | — |
 
-So prefill is **not** compute bound: the run sustains ~41 TFLOPS aggregate, 13%
+So prefill is **not** compute bound: the run sustains ~48 TFLOPS aggregate, 15%
 of the bf16 ceiling. Only the MoE GEMM is near a practical limit, at 64%. The
-attention kernel is the largest single item and the furthest from any roofline —
-5% of compute peak and ~28% of HBM — because the two passes double the gathered
-KV reads, the tiles arrive through an index list rather than a contiguous copy,
-and the `BLOCK_H x 512` fp32 accumulator keeps occupancy at one program per SM.
+attention kernel is the furthest from any roofline at 9% of compute peak and
+~38% of HBM: the tiles arrive through an index list rather than a contiguous
+copy, the `BLOCK_H x 512` fp32 accumulator keeps occupancy at one program per
+SM, and every KV block rescales that whole accumulator for the online softmax.
 
 Retuning for the 8 heads a TP8 rank owns is what moved it: `BLOCK_H` 16 -> 8
 (padding 8 real heads to a 16-row MMA wastes more than it saves) and
