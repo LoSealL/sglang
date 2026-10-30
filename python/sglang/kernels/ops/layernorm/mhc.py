@@ -2282,6 +2282,17 @@ def _hc_mix_stats_reduce_kernel(
 # K slicing, BLOCK_K and dot precision must stay independent of M;
 # a row must produce the same bits alone and in any batch routed to this backend.
 _HC_MIX_SLICE_CHOICES = (80, 64, 40, 32, 16, 8, 4, 2, 1)
+# SM80 has no async copy and its fp32 tf32x3 dot keeps the [BLOCK_M, BLOCK_K]
+# tile in registers, so the schedule that wins on B300/H200 (80 K-slices, 4
+# warps, 1 stage -- split K wide enough that a short tile each still fills the
+# GPU) is the wrong shape here: 80 slices restart every 64 columns and read
+# 128 bytes per row. Four slices with 2 warps and 2 stages let a CTA stream a
+# whole row range instead. A 4000-token prefill measures this kernel at 101.9
+# -> 66.7 ms (1.5x) and the request at 9171 -> 9598 tok/s.
+_SM80 = get_platform().is_sm80
+_HC_MIX_SM80_SLICE_CHOICES = (4, 2, 1)
+_HC_MIX_SM80_NUM_WARPS = 2
+_HC_MIX_SM80_NUM_STAGES = 2
 _HC_MIX_BLOCK_M = 32
 _HC_MIX_BLOCK_K = 64
 _HC_MIX_NUM_WARPS = 4
@@ -2314,7 +2325,7 @@ def _num_slices_for(k: int) -> int:
     """Slice count depends only on K, never on batch size M."""
     blocks = k // _HC_MIX_BLOCK_K
     assert k % _HC_MIX_BLOCK_K == 0, k
-    for n in _HC_MIX_SLICE_CHOICES:
+    for n in _HC_MIX_SM80_SLICE_CHOICES if _SM80 else _HC_MIX_SLICE_CHOICES:
         if blocks % n == 0:
             return n
     return 1
@@ -2359,8 +2370,8 @@ def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch
         BLOCK_M=block_m,
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_HC_MIX_NUM_STAGES,
+        num_warps=_HC_MIX_SM80_NUM_WARPS if _SM80 else _HC_MIX_NUM_WARPS,
+        num_stages=_HC_MIX_SM80_NUM_STAGES if _SM80 else _HC_MIX_NUM_STAGES,
     )
     _hc_mix_stats_reduce_kernel[(grid_m,)](
         part_mix,
@@ -2491,8 +2502,8 @@ def hc_mix_stats_sinkhorn(
         BLOCK_M=block_m,
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
-        num_stages=_HC_MIX_NUM_STAGES,
+        num_warps=_HC_MIX_SM80_NUM_WARPS if _SM80 else _HC_MIX_NUM_WARPS,
+        num_stages=_HC_MIX_SM80_NUM_STAGES if _SM80 else _HC_MIX_NUM_STAGES,
     )
     if _is_hip:
         hc_mix_reduce_sinkhorn_vec(
