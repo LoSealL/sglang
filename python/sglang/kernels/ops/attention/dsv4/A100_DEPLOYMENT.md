@@ -468,6 +468,31 @@ The four cheap families above are ~7.5 calls/token, i.e. the 17% if all of
 them go -- and the largest of them, `runtime_context`, is the design's
 per-forward-flag idiom applied per layer instead.
 
+#### Dispatch micro-edits do not buy wall time (measured)
+
+The call counts above are a budget, not a promise. Two of the identified
+families were removed and the step did not move:
+
+| edit | calls removed per step | TTFT at 3,884 tokens |
+| --- | ---: | --- |
+| marlin `_or_empty` shares one zero-length tensor | ~9,000 (1,590 empty + 4,314 device-index + 2,187 lazy-init) | 0.344 s |
+| `PlatformContext` caches its probe module | ~4,000 (1,086 imports + importlib's isinstance) | (same runs) |
+| before either | -- | 0.343-0.346 s |
+
+So ~13,000 of the 292,000 per-step calls are worth 0.00 s here, which says the
+wall clock is not being spent in leaf dispatch. The three-step trace says where
+it is instead: `all_reduce_2shot_pull` occupies 68.2 ms/step and NCCL's ring
+all-reduce another 25.9, together 29% of the step -- but a direct measurement of
+the same collective at the same size is **0.48 ms per call across eight ranks
+(19.2 ms for the 40 per step)**, which is the hardware limit: 39 MiB per rank is
+~142 GB/s of ring traffic on 300 GB/s of NVLink. The other ~75 ms is the
+collective waiting on the slowest rank.
+
+That reframes the remaining gap: 322 ms of wall minus 252 ms of GPU-busy leaves
+~70 ms, and neither half of it is per-op Python. It is ranks arriving at the
+same collective ~2 ms apart, forty times a step. Only deterministic replay (a
+captured prefill) removes that, which is the same project as above.
+
 Avenues measured and closed, so they are not re-tried:
 
 - `--boundary-reduction ar` instead of `rs+rsv`: 0.343-0.346 s against 0.349,
