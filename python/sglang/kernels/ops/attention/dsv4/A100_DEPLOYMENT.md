@@ -479,6 +479,20 @@ Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
    built. So `full` needs a torch-indexer port of that metadata and top-k, whose
    shapes are data-dependent -- a feature, not a flag.
 
+   What that port would cost, measured by un-gating the property on SM80 and
+   capturing: it reaches `full_topk.topk_prefill_captured` ->
+   `_deep_gemm_prefill_captured` -> `deep_gemm.fp8_fp4_paged_mqa_logits`, which
+   raises `TypeError: Mismatched type on argument #6 ... Expected DLTensor* but
+   got None` because the fp4 quant half does not exist here. The DeepGEMM-free
+   replacement does exist and is documented capture-compatible
+   (`fp8_paged_mqa_logits_torch`), but it reads the paged fp8 index-K cache,
+   while the Ampere low-ratio path scores through `dsv41_sparse.scores` driven by
+   `prefill_requests`, which walks requests and their variable-length chunks in
+   Python (`for request, chunks in requests: ... chunk.scores.topk(...)`). A
+   graph cannot replay that. Capturing it means rewriting the V4.1 prefill top-k
+   for the torch indexer in the fixed row-chunk form the fp4 path uses
+   (`metadata.row_chunks()`, `out_page_indices`), not swapping one call.
+
 3. Two-batch overlap is what the 28% row suggested, and it would overlap the
    collectives with compute — but there is nothing to overlap. It is also
    blocked for DSV4.1 by `deepseek_v4_hook.validate_deepseek_v41_features`, and
