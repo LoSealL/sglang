@@ -345,7 +345,7 @@ each part sustains against the A100-SXM4 bf16 peak of 312 TFLOPS.
 | Kernel group | GPU time | Share | FLOPs | Achieved |
 | --- | ---: | ---: | ---: | ---: |
 | `_sparse_mla_prefill_kernel` | 183 ms | 18% | 1.68 TFLOP | 28 TFLOPS (9% peak) |
-| TP all-reduce (`2shot_pull` + NCCL) | 282 ms | 28% | — | — |
+| TP all-reduce (`2shot_pull` + NCCL) | 282 ms | 28% | — | not communication, see below |
 | MoE (`fused_marlin_moe`) | 127 ms | 13% | 8.5 TFLOP | 200 TFLOPS (64% peak) |
 | Dense fp8 Marlin (attention projections) | 106 ms | 11% | 5.3 TFLOP | 121 TFLOPS (39% peak) |
 | `hc_mix_stats` + `mhc_post` + combine | 109 ms | 11% | — | — |
@@ -362,9 +362,87 @@ Retuning for the 8 heads a TP8 rank owns is what moved it: `BLOCK_H` 16 -> 8
 (padding 8 real heads to a 16-row MMA wastes more than it saves) and
 `BLOCK_KV` 64 -> 32 (room for three pipeline stages), 3.66 ms -> 2.03 ms per
 layer, and 8.2k -> 9.2k tok/s end to end. The end-to-end gain is smaller than
-the kernel gain because all-reduce is co-dominant at ~19%, and it varies between
-runs (132-235 ms across three profiles of the same workload), which is where the
-next real headroom is.
+the kernel gain because the fixed per-step cost, below, does not shrink with it.
+
+### The all-reduce share is not communication
+
+The 28% row above is a sum of kernel durations off one rank, and it does not mean
+the collectives move that much data. Two measurements say so.
+
+Isolated, with the algorithm forced on each call (8 ranks, 50 iterations, the
+production tensor shapes):
+
+| Tensor | Algorithm | Time | Bandwidth |
+| --- | --- | ---: | ---: |
+| `[128, 5120]` = 1.28 MB | `2shot_pull` (what prefill picks) | 38.6 us | 33.9 GB/s |
+| `[128, 5120]` = 1.28 MB | `1shot_pull` | 97.5 us | 13.4 GB/s |
+| `[4004, 5120]` = 40 MB | falls through to NCCL past the 16 MB cap | — | — |
+
+Forty of the small ones are 1.5 ms of a 358 ms step, 0.4%.
+
+In situ, per rank over the same three profiled steps (GPU ms):
+
+| rank | attention | `marlin_moe` | fp8 Marlin | `hc_mix` | other | all-reduce | GPU busy |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 183.4 | 140.0 | 128.4 | 67.6 | 168.0 | 282.3 | 969.6 |
+| 1 | 183.8 | 140.6 | 129.0 | 67.8 | 168.2 | 298.5 | 987.9 |
+| 3 | 183.4 | 140.2 | 128.7 | 67.7 | 164.4 | 132.0 | 816.5 |
+| 7 | 183.5 | 140.1 | 128.1 | 67.6 | 167.9 | 257.5 | 944.7 |
+
+Every compute family agrees across ranks to under 1%. Only the all-reduce column
+moves (132 ms to 298 ms), while the step takes the same ~358 ms on all eight
+ranks, and the arrival spread at a shared barrier is ~2 us with a single kernel
+measuring 47 us on one rank and 2,352 us on another. So that column is not data
+movement, and it is not one rank running late either: it is where a rank that is
+ahead spins, and the rank that is behind shows the same lost time as gaps
+between kernels (86 ms/step of GPU idle on rank 3 against 29 ms on rank 1).
+
+What the eight processes agree on is the total: 252 ms/step of compute and
+106 ms/step of everything else, on every rank. And the "everything else" is CPU:
+all eight TP workers sit at 100% of exactly one core through a prefill burst,
+8.0 cores in total.
+
+Batch-size scaling puts a number on the fixed part:
+
+| Prompt tokens | TTFT | tok/s |
+| ---: | ---: | ---: |
+| 943 | 0.180 s | 5,195 |
+| 1,903 | 0.191 s | 9,953 |
+| 2,803 | 0.302 s | 9,267 |
+| 3,884 | 0.360 s | 10,784 |
+
+943 tokens costs the same 180 ms as an empty step, so ~120 ms of every step is
+fixed and the marginal rate is 16.3k tok/s. At 4,004 tokens that predicts
+120 + 245 = 365 ms against the 358 ms measured.
+
+It cannot be amortized from the client either: two concurrent 3,800-token
+prefills take 0.722 s against 0.364 s for one, 10,539 tok/s against 10,402, so
+the scheduler runs them one at a time and charges the fixed cost to each.
+
+### What the fixed cost leaves as levers
+
+Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
+106 ms is dispatch, so the levers are, in order:
+
+1. Fewer Python ops per layer. The three-step trace logs 875,920
+   `python_function` and 58,222 `cpu_op` events, ~485 CPU ops per layer, all
+   issued from one saturated thread per rank.
+2. Prefill CUDA graphs, the flag-level version of (1).
+   `--cuda-graph-backend-prefill full` is not wired for this attention backend:
+   `deepseek_v4_backend._GraphBucket.of` has `DECODE_OR_IDLE`, `TARGET_VERIFY`
+   and `DRAFT_EXTEND` branches and raises `NotImplementedError` on `EXTEND`.
+   `--cuda-graph-backend-prefill breakable` does capture, but will not fit in
+   memory here: `--mem-fraction-static 0.86` is refused ("raise above 0.940,
+   minimum viable = 0.9394") and both 0.95 and 0.97 fail capture with a 320 MiB
+   request against 225 MiB free. That window is empty on 8x80 GB at
+   `--max-total-tokens 8192`; a smaller KV budget is what would open it.
+3. Two-batch overlap is what the 28% row suggested, and it would overlap the
+   collectives with compute — but there is nothing to overlap. It is also
+   blocked for DSV4.1 by `deepseek_v4_hook.validate_deepseek_v41_features`, and
+   the DSV4 path it would reuse asserts on the `hc_pre_from_prev_sublayer`
+   scheme.
+
+The ceiling: dropping the 120 ms puts a 4,004-token prefill at 16.8k tok/s.
 
 ## Tests
 
