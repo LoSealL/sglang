@@ -1835,10 +1835,14 @@ class PlatformContext:
     (~26 ns) rather than a device query.
     """
 
-    __slots__ = ("_overrides",)
+    __slots__ = ("_overrides", "_common")
 
     def __init__(self) -> None:
         object.__setattr__(self, "_overrides", {})
+        # The probe module, imported once on the first read. Importing it here
+        # would close an import cycle; importing it per read costs an import
+        # statement in the hottest config path (thousands per forward).
+        object.__setattr__(self, "_common", None)
 
     def __getattr__(self, name: str) -> Any:
         probe = _PLATFORM_PROBES.get(name) or _PLATFORM_VALUES.get(name)
@@ -1850,9 +1854,12 @@ class PlatformContext:
         overrides = object.__getattribute__(self, "_overrides")
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
+        common = object.__getattribute__(self, "_common")
+        if common is None:
+            from sglang.srt.utils import common
 
-        return getattr(_common, probe)()
+            object.__setattr__(self, "_common", common)
+        return getattr(common, probe)()
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(
