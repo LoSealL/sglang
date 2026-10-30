@@ -443,16 +443,22 @@ Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
    `mem-fraction-static`, so capping `--max-total-tokens` is what leaves the
    ~320 MiB a capture needs.
 
-   It is not replayable yet, and the reason is not memory. The capture trips over
-   `token_req_indices` -> `repeat_interleave(..., output_size=None)` on
-   `extend_seq_lens`, which reduces that device tensor on the host: illegal while
-   capturing. Supplying an `output_size` gets past capture but breaks replay,
-   because the graph replays a fixed `result_size` while the kernel re-reads the
-   live lengths (`Repeat.cu: result_size == cumsum_ptr[size - 1]`). That is what
-   `forward_low_ratio_sources` already guards for with `hoisted_req` /
-   `hoisted_pos`, "bucket-sized under the prefill graph"; the capture path does
-   not populate them, so it falls into the eager branch. Wiring that hoisting is
-   the work item -- not a flag and not a memory knob.
+   Replay needs the batch to be exactly its bucket, and both halves of that are
+   now in the tree: `token_req_indices` sizes `repeat_interleave` from
+   `extend_seq_lens_cpu` (the same lengths, so no sync, and a capture no longer
+   trips), and the runner rejects a padded batch for this model instead of
+   replaying it into a fixed `result_size` (`Repeat.cu: result_size ==
+   cumsum_ptr[size - 1]`). Pinning `--chunked-prefill-size` to the captured
+   bucket then does replay: the batch line reports `cuda graph: True` for the
+   full chunk and `False` for the tail.
+
+   It buys nothing. The same ~2,050-token prompt, chunked at 2,048 so that the
+   first chunk is exactly the bucket, costs 0.330 s with the graph and 0.332 s
+   with `--cuda-graph-backend-prefill disabled`. A 2,048-token replay is no
+   faster than an eager step of the same size, so `breakable` captures
+   fragments and breaks around the rest, and the 120 ms is not in the part it
+   captures. The gain needs `full`, i.e. the missing `_GraphBucket.EXTEND`
+   branch and the `hoisted_req` / `hoisted_pos` population above.
 
 3. Two-batch overlap is what the 28% row suggested, and it would overlap the
    collectives with compute — but there is nothing to overlap. It is also

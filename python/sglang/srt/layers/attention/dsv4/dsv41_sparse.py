@@ -81,6 +81,15 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend, target-verify and decode"
     )
+    if num_tokens is None:
+        # `extend_seq_lens` is a device tensor, so without `output_size`
+        # `repeat_interleave` reduces it on the host to size the result. That
+        # syncs, which a CUDA graph capture forbids, and the prefill graph
+        # captures this path. The CPU copy of the same lengths sums to exactly
+        # what that reduction would produce, and needs no sync.
+        lens_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if lens_cpu is not None:
+            num_tokens = int(sum(lens_cpu))
     return torch.repeat_interleave(
         req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
     )

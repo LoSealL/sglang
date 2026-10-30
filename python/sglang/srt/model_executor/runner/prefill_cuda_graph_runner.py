@@ -1410,6 +1410,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        # The V4.1 low-ratio source path sizes `repeat_interleave` from the live
+        # per-request lengths, so a replay reproduces the captured result only
+        # when the batch is exactly its bucket; padding a short tail into one
+        # trips `result_size == cumsum_ptr[size - 1]` on the device. Run those
+        # eager instead, which is what a chunked prefill's last chunk is.
+        if self.is_dsv41_model and padded_num_tokens != num_tokens:
+            return False
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
         return True
