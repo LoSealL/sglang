@@ -505,6 +505,17 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+        elif get_platform().is_sm80:
+            # Ampere has no DeepGEMM attention build, so both paged-MQA-logits
+            # pieces are unavailable: get_paged_mqa_logits_metadata (asserts
+            # "Unsupported architecture" once a verify batch makes
+            # rows_per_request > 1 and thus leaves the in-tree Triton planner)
+            # and fp8_paged_mqa_logits. The torch logits path needs neither,
+            # and plain decode is unaffected because it plans top-k v2 in-tree.
+            # Measured with DSPARK: 6 draft rows used to raise
+            # tvm.error.InternalError in init_forward_metadata_indexer.
+            if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the

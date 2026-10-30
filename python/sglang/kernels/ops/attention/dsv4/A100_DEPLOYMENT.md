@@ -148,6 +148,9 @@ against.
   the missing graph and the portable kernel's lack of tensor-core `tl.dot`.
 - **Fixed SWA window.** The header of `deepseek_v4_backend.py` hard-codes
   `SWA_WINDOW = 128`; the sparse kernels assume the same width.
+- **DSpark is checked for correctness, not for speedup on real traffic.** The
+  11.4 tok/s figure comes from one prompt; accept length, accuracy and DSpark
+  over PD were not measured.
 
 ## Heterogeneous PD (A100 prefill + RTX 6000D decode)
 
@@ -237,6 +240,52 @@ whatever CUDA-graph settings that GPU supports.
   (`is_prefill_only` only affects logits and attention). Whether a prefill rank
   can free the engram tables (190 GiB) is the largest single lever on the cost
   of adding this tier, and it is not investigated.
+
+## Speculative decoding (DSpark)
+
+DSpark runs on Ampere, but it needed one more fallback than plain serving.
+The checkpoint bundles the draft head (`dspark_block_size: 5`,
+`dspark_target_layer_ids: [37, 38, 39]`), so
+`--speculative-algorithm DSPARK` picks it up from `--model-path` and the draft
+MoE runs on the same MXFP4 Marlin path fixed above
+(`speculative_moe_runner_backend: marlin`).
+
+What broke was the indexer. `PagedIndexerMetadata` plans paged-MQA-logits
+metadata with the in-tree Triton planner only while
+`rows_per_request == 1`, and DSpark verify has one row per draft token (6
+here). The other branch calls `deep_gemm.get_paged_mqa_logits_metadata`, whose
+DeepGEMM build has no Ampere attention kernels:
+
+```
+tvm.error.InternalError: Assertion error
+  (/deepgemm/csrc/apis/attention.hpp:243): Unsupported architecture
+  ... deepseek_v4_backend.py:1473 init_forward_metadata_indexer
+  ... dsv4/metadata.py:281 __post_init__
+  ... dspark_verify.py:325 _forward_prepared_verify
+```
+
+`model_hook.py` now turns on `SGLANG_FP8_PAGED_MQA_LOGITS_TORCH` for the
+Ampere family, as the SM120 branch already did for its own arch. That drops the
+DeepGEMM planner (`deep_gemm_metadata = None`) and routes logits to the torch
+implementation, which needs no per-arch kernel.
+
+Measured on this host (TP8, page_size 256, single stream, 64 generated tokens):
+
+| Path | Decode | Prefill (626-token prompt) |
+| --- | --- | --- |
+| no speculation, torch logits off | 6.38 tok/s | 1,560 tok/s |
+| no speculation, torch logits on | 6.19 tok/s | 3,405 tok/s |
+| DSPARK | 11.4 tok/s | — |
+
+Decode is unchanged within noise; prefill is faster because the torch logits
+path skips the DeepGEMM/JIT metadata planning entirely. Outputs were coherent
+and matched the non-speculative run on the prompts tested, which is not a
+substitute for an acceptance-rate or accuracy measurement.
+
+PD with DSpark is a further step that was not run: it requires two SWA states
+(target and draft) and describes itself through `get_dsv41_spec_layout`, whose
+`kv_item_lens` / `state_item_lens` carry the byte geometry for the draft
+pools, alongside the per-component descriptor this pool reports.
 
 ## Prefill performance
 
