@@ -1302,7 +1302,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if (
             self.block_quant
             and get_platform().is_sm80
-            and get_bool_env_var("SGLANG_FP8_DENSE_BF16")
+            and envs.SGLANG_FP8_DENSE_BF16.get()
         ):
             from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 

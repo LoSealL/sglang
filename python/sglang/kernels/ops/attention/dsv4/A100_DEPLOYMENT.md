@@ -670,7 +670,17 @@ good at, and the KV pool has to shrink a little (mem-fraction-static 0.95 -> 0.9
 
     SGLANG_FP8_DENSE_BF16=1 ... --max-total-tokens 4608 --mem-fraction-static 0.97
 
-Dispatch per batch width (cuBLAS above a few hundred rows, Marlin below) would keep both
+`--boundary-reduction rs` / `rsv` are a wash rather than a win: reduce-scatter instead of
+all-reduce measures 0.279-0.280 s against 0.279-0.281 for `ar`, on a step where the
+collective is 87.7 ms. The sparse MLA prefill kernel is already at its best head block
+(`_pick_block_h` returns 8 for the 8 heads a TP8 rank owns, measured 2.01 vs 3.62 ms at
+16), and the hyper-connection chain is at ~1.8 TB/s of the 2.0 TB/s HBM, so its 36.7 ms
+is traffic rather than slack: the only way to shorten it is to fuse `mhc_post` into
+`_mhc_combine` and save one 159 MB read+write per sublayer, worth about 12 ms. The MoE
+cannot follow the dense layers onto bf16: its experts are fp4 at half a byte per
+parameter, so a bf16 copy is four times the memory.
+
+Dispatch per batch width (cuBLAS above a few hundred rows, Marlin below) would keep bothDispatch per batch width (cuBLAS above a few hundred rows, Marlin below) would keep both
 wins and needs the two weight formats resident at once, about one more byte per dense
 parameter; that is the remaining follow-up here.
 

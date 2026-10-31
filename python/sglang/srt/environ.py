@@ -1090,6 +1090,10 @@ class Envs:
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    # Run block-quantized fp8 dense layers as dequantized bf16 cuBLAS GEMMs
+    # instead of Marlin. Faster for prefill-width batches on hardware without
+    # fp8 tensor cores; slower for decode's one-row batches.
+    SGLANG_FP8_DENSE_BF16 = EnvBool(False)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
