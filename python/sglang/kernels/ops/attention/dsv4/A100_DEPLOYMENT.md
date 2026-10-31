@@ -650,6 +650,42 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### The dense GEMMs are running on the wrong kernel
+
+Of the 41.8 ms the dense marlin GEMMs take, roughly half is avoidable. Marlin is an
+INT4 kernel; on Ampere the fp8 block-quantized dense weights get dequantized to bf16
+and then handed to it, and for these shapes a plain bf16 cuBLAS GEMM is much faster.
+Timing the seven projections of one layer at their TP8 widths (M=3,890):
+
+| projection | shape | cuBLAS bf16 |
+| --- | --- | ---: |
+| q_a | 3890x5120 x 5120x160 | 0.061 ms |
+| q_b | 3890x1280 x 1280x512 | 0.047 ms |
+| kv_a | 3890x5120 x 5120x576 | 0.158 ms |
+| kv_b | 3890x512 x 512x2048 | 0.054 ms |
+| o_proj | 3890x4096 x 4096x640 | 0.129 ms |
+| shared gate_up | 3890x5120 x 5120x288 | 0.086 ms |
+| shared down | 3890x288 x 288x640 | 0.019 ms |
+| **one layer** | | **0.55 ms** (0.08 TFLOP, 137 TFLOPS) |
+| **40 layers** | | **22.1 ms** |
+
+That is 22.1 ms against the 41.8 ms Marlin takes, i.e. ~20 ms of the 36 ms gap, and it
+means the dense path is currently running at about 73 TFLOPS where cuBLAS reaches 137.
+
+SGLang already has the faster path -- `_block_fp8_bf16_linear`, a cached dequantized
+bf16 weight plus `torch.matmul` -- but only reaches it when a layer's shape falls outside
+Marlin's thread tiles (`_needs_bf16_dequant_fallback`), which none of these do.
+`can_auto_enable_marlin_fp8()` turns Marlin on for every sm80 device unconditionally.
+
+Forcing it off (`SGLANG_NO_FP8_MARLIN=1`, a temporary probe since reverted) does serve
+correct output -- the same "= 28" answer as the Marlin run -- but OOMs during the first
+prefill: the fallback dequantizes each layer's weight lazily *inside* the forward, so
+3.2 GB per rank of bf16 copies is allocated after the KV pool has already been sized as
+though they did not exist. Making this real means dequantizing in
+`process_weights_after_loading`, before the pool is sized, and then choosing the path per
+shape (cuBLAS for prefill-width batches, Marlin for decode's one-row batches, where the
+INT4 kernel is the right one). That is the next piece of work, and it is worth ~20 ms.
+
 #### Where the 3,890-token step actually stands
 
 Profiled, on rank 0, after every fix in this document:
