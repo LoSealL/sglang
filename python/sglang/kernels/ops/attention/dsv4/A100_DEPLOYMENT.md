@@ -669,6 +669,21 @@ tokens**. The 137 ms is not GPU work -- a 1,458-token prompt already pays it, an
 the CPU side of ~3,300 kernel launches per step, which is why replaying the step from a
 CUDA graph (it works, see above) does not move it.
 
+The configuration that reaches it, and how it verifies:
+
+    .venv/bin/python -m sglang.launch_server --model-path <DSV4.1-Flash> \
+        --tp 8 --moe-runner-backend marlin --context-length 12288 \
+        --max-total-tokens 8448 --mem-fraction-static 0.95 \
+        --max-running-requests 2 --cuda-graph-backend-decode full \
+        --cuda-graph-bs-decode 1 2 --boundary-reduction ar
+
+Three independent launches at 6,144 tokens: 0.387 / 0.390 / 0.389 s, i.e. 15,867 / 15,768
+/ 15,787 tok/s, and a 7,015-token prompt answers correctly ("42" for 17+25 through 6,300
+tokens of filler). Marlin rather than the bf16-dense path here, deliberately: the
+dequantized copy's 3 GB per rank does not leave room for both a pool that can hold a 7k
+prompt and the prefill activations, and this config must not OOM on the long prompts that
+are the point.
+
 So the answer to "how fast is prefill" is a curve, and single-stream prefill on this
 machine crosses 15,000 tok/s for prompts above roughly 5.3k tokens and cannot cross it
 below that: at 3,890 tokens the floor is the 137 ms fixed cost itself, which is 21% of
