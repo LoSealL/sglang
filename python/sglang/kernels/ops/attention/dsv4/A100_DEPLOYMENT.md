@@ -650,6 +650,55 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### The step is paced by launch count, not by any kernel (measured)
+
+A TTFT sweep settles what the profile could not. Sweeping prompt length on the
+best config:
+
+| prompt tokens | 4 | 70 | 534 | 1424 | 2472 | 3589 | 3897 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| TTFT (s) | 0.169 | 0.171 | 0.176 | 0.184 | 0.204 | 0.332 | 0.348 |
+
+TTFT is **flat at 169 ms until about 1,500 tokens**, then grows. A four-token
+request and a 1,400-token request cost the same, so that 169 ms is not prefill
+compute: it is the fixed cost of a step. Profiling a five-token request names it
+exactly -- **28 ms of GPU work across 3,620 kernel launches**, essentially the same
+launch count as a 3,853-token step (3,890). Per layer that is **90.5 launches**,
+and the wall cost per launch is **47 us**, which is far more than a launch costs;
+the trace holds 145,223 python events, i.e. **40 python calls per kernel**. The
+critical path is python dispatch per kernel, not bytes or FLOPs.
+
+Above the flat region the marginal cost is ~46 us/token, so 3,897 tokens is
+169 (launches) + 179 (compute) = 348 ms, and the two are additive: the CPU issues
+a layer, the GPU drains it, repeat.
+
+This single model explains three nulls that looked unrelated:
+
+- removing 78 ms of GPU busy (custom all-reduce -> NCCL: 379.4 -> 301.4 ms of
+  kernel time) changed TTFT by **0.000 s**;
+- `ar`, `rs`, `rs+rsv` and `--enable-fused-moe-sum-all-reduce` all land within
+  noise -- the GPU has slack to absorb any of them;
+- `--cuda-graph-backend-prefill breakable` is **exactly** the baseline (0.346 s),
+  because it does not reduce the launch count.
+
+It also retires two candidate explanations. Decode graphs cannot rescue the first
+token: this backend's decode path calls `torch.unique` in
+`_forward_decode_sparse_sm80`, so a decode graph cannot be captured at all, and a
+`max_new_tokens=1` request needs no decode forward anyway (the first token is
+sampled from the prefill's logits). Slow tokenization is not it either: the native
+`/generate` route with pre-tokenized input ids measures the same 0.341-0.348 s
+once every request carries unique ids and the log confirms `#cached-token: 0`.
+
+The arithmetic that follows: 15,000 tok/s at 3,900 tokens is 259 ms, so the fixed
+169 ms has to fall to ~80 ms, i.e. **the launch count has to roughly halve** while
+the 179 ms of compute stays. With 47 us per launch that is ~45 launches per layer
+instead of 90.5. The two largest groups in the histogram are `fill_`
+(16.3 per layer) and the hyper-connection family -- `hc_mix_stats_partial`,
+`hc_mix_stats_reduce`, `hc_split_sinkhorn`, `mhc_post_tilelang`, `mhc_combine` --
+at 2.0 each, 10 per layer together. Removing the redundant fills and fusing the
+hyper-connection chain is worth ~26 launches per layer, ~49 ms, without touching a
+single kernel's internals.
+
 Avenues measured and closed, so they are not re-tried:
 
 - `--boundary-reduction ar` instead of `rs+rsv`: 0.343-0.346 s against 0.349,
