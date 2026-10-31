@@ -650,6 +650,32 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### The sparse path was scoring 8x the heads this rank owns
+
+`q` reaches the attention backend padded to **64** heads, the shape the decode
+kernels' head specialization wants. A TP8 rank owns `tp_q_head_num = 8` of them
+(`n_local_heads = num_attention_heads // attn_tp_size`), and the in-tree SM100/SM120
+legs say so explicitly -- `q[..., : layer.tp_q_head_num, :]`, with the comment "The
+64-head pad only serves the decode kernel's h_q specialization; the prefill kernel
+takes any h_q, so drop it." The SM80 leg never trimmed, and the portable Triton
+kernel accepts whatever head count it is given, so Ampere scored and mixed all 64:
+**eight times the attention work this rank is responsible for**, in prefill and in
+decode.
+
+Trimming costs one line at the dispatch point. The answer is bit-identical (the same
+48-token reply, character for character), which is the proof that the 56 extra heads
+were padding and not hidden work.
+
+| 3,890-token prefill | TTFT | tok/s |
+| --- | ---: | ---: |
+| 64 heads (padded) | 0.331 s | 11,747 |
+| 8 heads (owned) | **0.292 s** | **13,326** |
+
+It also corrects an analysis error of mine in the previous entries: with 64 heads the
+per-layer attention looked like 326 GFLOP at 63% of the A100 bf16 peak, i.e. "near
+optimal, leave it alone". The real figure is eight times smaller, so attention was
+never the ceiling -- it was burning a third of the step on padded lanes.
+
 #### 80 device synchronizations per prefill step, for a union nothing needed
 
 A prefill step of 3,890 tokens carried 116 host synchronizations, 180.8 ms of them by

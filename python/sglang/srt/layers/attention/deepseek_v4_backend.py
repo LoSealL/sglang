@@ -4259,6 +4259,13 @@ class DeepseekV4AttnBackend(
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
+                # ``q`` may arrive padded to 64 heads for the decode kernels'
+                # head specialization while this rank owns only
+                # ``layer.tp_q_head_num`` of them. The SM90/SM120 legs trim that
+                # pad; the portable Triton kernel accepts any head count, so it
+                # has to trim too or it scores eight times this rank's heads.
+                if q.shape[-2] > layer.tp_q_head_num:
+                    q = q[..., : layer.tp_q_head_num, :].contiguous()
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
@@ -4360,6 +4367,16 @@ class DeepseekV4AttnBackend(
                 # sparse decode raises "Unsupported architecture" on Ampere.
                 # Dequantize the paged fp8 cache into a bf16 workspace and run
                 # the portable Triton sparse-MLA kernel instead.
+                import os as _os2
+
+                if _os2.environ.get("SGLANG_QH_LOG"):
+                    print(
+                        f"qh layer={layer_id} tp_q_head_num={layer.tp_q_head_num} "
+                        f"q={tuple(q.shape)} mode={forward_batch.forward_mode}",
+                        flush=True,
+                    )
+                if q.shape[-2] > layer.tp_q_head_num:
+                    q = q[..., : layer.tp_q_head_num, :].contiguous()
                 o = self._forward_decode_sparse_sm80(
                     q=q,
                     layer_id=layer_id,
