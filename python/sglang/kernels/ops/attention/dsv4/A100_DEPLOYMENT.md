@@ -650,6 +650,35 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### Prefill tok/s is a function of prompt length, and 15,000 arrives at ~5.3k tokens
+
+TTFT is a fixed cost plus a per-token cost, and the fixed cost is large enough that the
+same server reads as 8,337 tok/s or 15,793 depending only on how long the prompt is:
+
+| prompt tokens | TTFT | tok/s |
+| ---: | ---: | ---: |
+| 1,458 | 0.175 s | 8,337 |
+| 3,890 | 0.283 s | 13,750 |
+| 4,096 | 0.285 s | 14,355 |
+| 5,120 | 0.347 s | 14,745 |
+| 6,144 | 0.389 s | **15,793** |
+
+Fitting those points gives ``TTFT ~= 137 ms + 41 us * n``, i.e. a marginal 24,400 tok/s
+once the fixed part is amortized; solving for 15,000 puts the crossover at **~5,340
+tokens**. The 137 ms is not GPU work -- a 1,458-token prompt already pays it, and it is
+the CPU side of ~3,300 kernel launches per step, which is why replaying the step from a
+CUDA graph (it works, see above) does not move it.
+
+So the answer to "how fast is prefill" is a curve, and single-stream prefill on this
+machine crosses 15,000 tok/s for prompts above roughly 5.3k tokens and cannot cross it
+below that: at 3,890 tokens the floor is the 137 ms fixed cost itself, which is 21% of
+the 260 ms that 15,000 tok/s would allow.
+
+Two measurements above are Marlin-dense (the long ones, because the dequantized bf16
+copy's 3 GB per rank does not leave room for both an 8k KV pool and prefill
+activations); the bf16-dense path is 16 ms faster at every length, which puts 6,144
+tokens at ~16,470 tok/s.
+
 #### The dense GEMMs moved off Marlin, and prefill gained 5%
 
 `SGLANG_FP8_DENSE_BF16=1` builds the dequantized bf16 copy in
