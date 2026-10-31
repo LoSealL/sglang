@@ -650,6 +650,47 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### Where the 3,890-token step actually stands
+
+Profiled, on rank 0, after every fix in this document:
+
+| item | calls | GPU ms |
+| --- | ---: | ---: |
+| NCCL all-reduce (39.8 / 47.8 MB) | 43 | 87.7 |
+| marlin MoE (fp4 experts dequantized to bf16) | 80 | 63.4 |
+| dense marlin (fp8 weights dequantized to bf16) | 321 | 41.8 |
+| hyper-connection chain | 442 | 36.7 |
+| sparse MLA prefill | 40 | 17.3 |
+| everything else (elementwise, norms, top-k, dequant) | ~2,400 | ~49 |
+| **total** | 3,324 | **295.8** |
+
+Two properties of the machine bound this. The experts are fp4
+(`expert_dtype: fp4` in the checkpoint) and the dense weights fp8 block-scaled, and
+Ampere has no tensor cores for either, so every GEMM is a bf16 marlin GEMM against a
+dequantized copy of the weights -- there is no faster numeric path to switch to. And the
+step is GPU-bound rather than launch-bound: replaying it from a CUDA graph (which does
+work now, see above) changes nothing, so the 3,324 launches are already fully hidden.
+
+The knobs that were measured and rejected, so they need not be tried again:
+`--enable-nccl-nvls`, `NCCL_PROTO=Simple`, `NCCL_ALGO=Tree`, `--disable-custom-all-reduce`
+(all within 3 ms), the custom all-reduce in both of its algorithms (two-shot pull
+0.306 s, one-shot push 0.356 s, plain NCCL 0.293 s), `--enable-single-batch-overlap`
+(no change), `--enable-two-batch-overlap` (rejected by the model: "DeepSeek-V4.1 does
+not support two-batch overlap yet"), `--moe-runner-backend triton` (fp4 expert layout)
+and, for the record, the fused-mHC path: it is registered only under
+`get_platform().is_blackwell` and templated for TP2/TP4 (`_FUSED_MHC_TP_SIZES`), so an
+8-rank Ampere deployment cannot reach it. The hyper-connection kernels themselves are
+already at their best launch configuration -- sweeping `num_warps` (2/4/8/16),
+`num_stages` and slice count (4/8/16/32) around `_hc_mix_stats_partial_kernel` makes it
+uniformly worse, and `BLOCK_K=32` buys 12% (2.6 ms per step) only by changing the
+reduction order.
+
+The remaining ~36 ms is therefore not a knob. It has to come from overlapping the
+all-reduce with compute inside one prefill (the model has no such path today) or from an
+fp8 all-reduce (NCCL has no fp8 on Ampere; `--enable-quant-communications` is NPU-only),
+which is why the best honest number for this hardware is ~0.291-0.294 s, 13,300-13,370
+tok/s, against the 0.2598 s that 15,000 tok/s would need.
+
 #### The collective is not slow. It is measuring rank skew.
 
 The last entry left the all-reduce as the step's largest item and blamed its
