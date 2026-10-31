@@ -547,6 +547,59 @@ short prefix in a large bucket scores up to `lc_max / real_lc` wasted work.
 Worth stating plainly, because it is the reason the eager path stays faster
 than a naive ported graph for small prefills.
 
+#### The indexer rewrite, and the wall behind it
+
+The plan above turned out to be one function, not a rewrite: `prefill_graph_scores`
+in `v41_indexer/scoring.py`. The eager reader's three host reads all have
+device-side replacements that already existed:
+
+- request boundaries -> the plan's `request_row_blocks` (a bucket constant,
+  because replay is layout-exact),
+- `lens.max().item()` -> `max_compressed_cols`, one padded column count for the
+  bucket, with the existing `j >= lens` mask keeping padding out of the selection,
+- the row loop bound -> the same block list.
+
+Queries and head weights are projected inside the graph (plain tensor work), and
+per-row visible lengths come from `PagedIndexerMetadata.compressed_seq_lens`,
+which the Blackwell plan already computed per row. So Ampere needed no new
+kernel: `scoring.scores` is the fused `sparse_scores` Triton launch and the
+dequant is sync-free, both already here.
+
+Two bounds are load-bearing, and both were found by a device-side assert rather
+than by reasoning:
+
+1. Column `j` reads `req_to_token[row, j * ratio]`, so the scored column count
+   may not exceed `(req_to_token.shape[1] - 1) // ratio + 1`. The page table's
+   own capacity is *larger* than that (it is padded), and `_prefill_graph_seq_limit()`
+   reports a context larger than the table width, so neither is a safe bound by
+   itself.
+2. Columns past a block's longest visible length would gather page-table entries
+   that request never wrote, indexing the index-K pool out of range. They are
+   substituted with slot 0, which is always valid and always masked to -inf
+   before the selection, so the substitution is unobservable.
+
+With that, capture runs the whole model up to the first **candidate consumer**,
+and stops at `indexer.uses_candidates`:
+
+```
+AssertionError: candidate blocks are not wired into the whole-body prefill graph
+```
+
+The candidate scheme is why this is not finished. A source layer must publish a
+block table before its consumers can score, and on Blackwell that publish is
+`publish_prefill` -> `get_deep_gemm_prefill_data` -> fp4 `deep_gemm` MQA logits
+over block representatives. `publish_prefill_graph` is not a way around it: it
+calls `publish_prefill` internally and exists to run at breakable-graph *eager
+breaks*, outside any capture. So the honest statement of the remaining work is
+"a capture-safe block-table publish for Ampere", which is block-level logits
+plus a top-k over blocks plus table materialization -- a second kernel-shaped
+project, not a tweak to the one above.
+
+Correctness of what did run is unvalidated: no capture completed, so there is no
+logits comparison against eager yet. The padded-column port is also slower per
+token than eager on a short prefix (`max_cols / real_lc` wasted scores), which is
+the same trade the plan predicted.
+
 Avenues measured and closed, so they are not re-tried:
 
 - `--boundary-reduction ar` instead of `rs+rsv`: 0.343-0.346 s against 0.349,

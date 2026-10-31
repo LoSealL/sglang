@@ -1645,15 +1645,25 @@ class DeepseekV4AttnBackend(
                 create(compress_ratio=128) if self.has_c128 else None
             ),
         )
-        if use_prefill_cuda_graph and self.low_ratio_prefill_graph:
+        if use_prefill_cuda_graph and self._low_ratio_source_plan:
             low = core_attn_metadata.low_ratios
             metadata.c1_indexer_metadata = (
-                self._low_ratio_prefill_indexer_metadata(core_attn_metadata, 1)
+                self._low_ratio_prefill_indexer_metadata(
+                    core_attn_metadata,
+                    1,
+                    row_blocks=extend_seq_lens_cpu,
+                    request_row=req_pool_indices_repeated,
+                )
                 if 1 in low
                 else None
             )
             metadata.c2_indexer_metadata = (
-                self._low_ratio_prefill_indexer_metadata(core_attn_metadata, 2)
+                self._low_ratio_prefill_indexer_metadata(
+                    core_attn_metadata,
+                    2,
+                    row_blocks=extend_seq_lens_cpu,
+                    request_row=req_pool_indices_repeated,
+                )
                 if 2 in low
                 else None
             )
@@ -1663,8 +1673,22 @@ class DeepseekV4AttnBackend(
             )
         return metadata
 
+    @property
+    def _low_ratio_source_plan(self) -> bool:
+        """Whether low-ratio sources take their per-row plan from a forward plan.
+
+        `low_ratio_prefill_graph` bundles the fp4 paged-logits kernel with this
+        plan; only the plan is what a capture needs, and Ampere can build it.
+        """
+        return bool(self.low_ratios) and get_parallel().attn_cp_size == 1
+
     def _low_ratio_prefill_indexer_metadata(
-        self, core: DSV4AttnMetadata, compress_ratio: int
+        self,
+        core: DSV4AttnMetadata,
+        compress_ratio: int,
+        *,
+        row_blocks: Optional[List[int]] = None,
+        request_row: Optional[torch.Tensor] = None,
     ) -> PagedIndexerMetadata:
         num_pages = core.page_table.shape[1]
         max_seq_len = self._prefill_graph_seq_limit()
@@ -1680,6 +1704,18 @@ class DeepseekV4AttnBackend(
         # Unclamped: a token with no completed group scores nothing, as in eager.
         c_seq_lens = (core.seq_lens_casual // compress_ratio).to(torch.int32)
         row_chunk = _PREFILL_GRAPH_INDEXER_ROW_CHUNK
+        # One padded column count for the whole bucket: the longest context any
+        # request can have at replay. Padding past a request's visible length is
+        # masked to -inf, so it costs work but cannot change the selection.
+        # A request cannot see past what its page table addresses, so that bounds
+        # the scored columns; a replayed context limit only tightens it.
+        capacity = (core.page_table.shape[1] * self.page_size) // compress_ratio
+        # Column j reads req_to_token[.., j * ratio], so the table's own width is
+        # the hard bound on how many columns a block may score.
+        width = self.req_to_token.shape[1]
+        capacity = min(capacity, (width - 1) // compress_ratio + 1)
+        limit = self._prefill_graph_seq_limit()
+        cols = capacity if limit is None else min(capacity, limit // compress_ratio)
         return PagedIndexerMetadata(
             page_size=self.page_size,
             compressed_page_size=index_page_size,
@@ -1689,6 +1725,9 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
             compress_ratio=compress_ratio,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
+            request_row_blocks=tuple(row_blocks or ()),
+            max_compressed_cols=max(1, cols),
+            request_row_of_row=request_row,
         )
 
     @property
@@ -3350,6 +3389,23 @@ class DeepseekV4AttnBackend(
                     [req, req[-1:].expand(positions.shape[0] - req.shape[0])]
                 )
             pos = positions
+        from sglang.srt.model_executor.runner_utils.prefill_graph import (
+            is_in_full_prefill_graph,
+        )
+
+        if (
+            forward_batch.forward_mode.is_extend()
+            and is_in_full_prefill_graph()
+            and self._low_ratio_source_plan
+        ):
+            # Whole-body capture: score from the plan's per-row lens and row
+            # blocks. The eager reader below walks requests on the host, which
+            # CUDA refuses while capturing.
+            if run_compressor and layer.compressor is not None:
+                self._low_ratio_compress(layer, x, req, pos, forward_batch)
+            if run_indexer and layer.indexer is not None:
+                self._low_ratio_index_topk_graph(layer, x, q_lora, pos)
+            return
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
@@ -3809,6 +3865,36 @@ class DeepseekV4AttnBackend(
                 self.prefill_candidates.consume_prefill(inputs, published)
             else:
                 self.full_topk_indexer.topk_prefill(inputs)
+
+    def _low_ratio_index_topk_graph(self, layer, x, q_lora, pos) -> None:
+        """The index step of a whole-body prefill capture.
+
+        Queries and head weights are projected here (plain tensor work), and
+        everything that would otherwise be a host read -- each request's visible
+        length, its row block, its page-table row -- comes from the plan.
+        """
+        indexer = layer.indexer
+        ratio = layer.compress_ratio
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None, f"no prefill graph indexer plan for {ratio = }"
+        assert not indexer.uses_candidates, (
+            "candidate blocks are not wired into the whole-body prefill graph"
+        )
+        core = self.forward_metadata.core_metadata
+        inputs = CapturedPrefillInputs(
+            indexer=indexer,
+            layer_id=layer.layer_id,
+            q=indexer.queries(q_lora, layer.freqs_cis[pos]),
+            weights=indexer.head_weights(x),
+            paged_metadata=metadata,
+            out_page_indices=core.sparse_page_indices(ratio),
+            out_raw_indices=core.sparse_raw_indices(ratio),
+        )
+        self.full_topk_indexer.topk_prefill_captured(inputs)
 
     def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
         ratio = layer.compress_ratio

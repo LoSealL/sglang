@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass, field, fields
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -189,6 +189,16 @@ class PagedIndexerMetadata:
     # all rows at once.
     row_chunk: int = 0
     rows_per_request: int = 1
+    # Prefill-graph low-ratio sources: the query rows each request owns, in row
+    # order, and the column count every one of them scores against. Both are
+    # fixed for a capture bucket -- the layout because replay is layout-exact,
+    # the column count because it pads each request's visible length up to the
+    # bucket's, which is what lets the top-k run at one shape.
+    request_row_blocks: Tuple[int, ...] = ()
+    max_compressed_cols: int = 0
+    # [rows] the page-table row of each query row, so a block can look up its
+    # request without a host loop.
+    request_row_of_row: Optional[torch.Tensor] = None
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)

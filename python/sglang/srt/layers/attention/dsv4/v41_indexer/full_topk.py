@@ -23,6 +23,7 @@ from .scoring import (
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     get_index_k_cache,
+    prefill_graph_scores,
     prefill_requests,
     quantize_index_q,
     select_decode,
@@ -62,6 +63,14 @@ class FullTopKIndexer:
             self._torch_prefill(inputs)
 
     def topk_prefill_captured(self, inputs: CapturedPrefillInputs) -> None:
+        if not self.use_deep_gemm_prefill:
+            # Ampere keeps the torch scorer; only the fp4 kernel is SM100-only.
+            prefill_graph_scores(
+                inputs=inputs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token=self.req_to_token,
+            )
+            return
         self._deep_gemm_prefill_captured(inputs)
 
     def topk_decode(self, inputs: DecodeInputs) -> None:

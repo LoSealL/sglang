@@ -24,7 +24,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
-from .types import DecodeInputs, PrefillInputs
+from .types import CapturedPrefillInputs, DecodeInputs, PrefillInputs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
@@ -364,6 +364,73 @@ def _score_chunks(
         s = indexer.scores(q[tok_c], index_k, weights[tok_c])
         s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
         yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
+
+
+def prefill_graph_scores(
+    *,
+    inputs: CapturedPrefillInputs,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    req_to_token: torch.Tensor,
+) -> None:
+    """The captured form of `prefill_requests`: same scores, one shape.
+
+    The eager reader walks requests on the host -- `unique_consecutive().tolist()`,
+    `lens.max().item()` -- which CUDA rejects while capturing. Here every one of
+    those is a plan constant instead: the request row blocks are the layout
+    (replay is layout-exact) and `max_compressed_cols` pads each request's
+    visible length up to the bucket's, with `j >= lens` masking keeping the
+    padding out of the selection. Queries and head weights arrive already
+    projected, so nothing on this path reads a value back to the host.
+    """
+    indexer = inputs.indexer
+    metadata = inputs.paged_metadata
+    ratio = metadata.compress_ratio
+    max_cols = metadata.max_compressed_cols
+    blocks = metadata.request_row_blocks
+    request_row = metadata.request_row_of_row
+    assert request_row is not None and blocks, "the plan carries no row blocks"
+    q, weights = inputs.q, inputs.weights
+    # Visible compressed positions of each row, per row, as a device tensor.
+    lens_all = metadata.compressed_seq_lens
+    topk = min(indexer.index_topk, max_cols)
+    j = torch.arange(max_cols, device=q.device)
+    rows_per_chunk = max(
+        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * max_cols * 2)
+    )
+
+    inputs.out_raw_indices.fill_(-1)
+    if inputs.out_page_indices is not None:
+        inputs.out_page_indices.fill_(-1)
+
+    start = 0
+    for n_rows in blocks:
+        if n_rows <= 0:
+            continue
+        lens = lens_all[start : start + n_rows]
+        # Columns past the block's longest visible length would gather
+        # page-table entries this request never wrote, indexing the index-K
+        # pool out of range. Slot 0 is always valid and those columns are
+        # masked to -inf before the selection, so this is unobservable.
+        raw = req_to_token[request_row[start], j * ratio].to(torch.int64) // ratio
+        slots = torch.where(j < lens.max(), raw, torch.zeros_like(raw))
+        index_k = token_to_kv_pool.get_low_ratio_index_k_dequant(
+            inputs.layer_id, slots
+        )
+        for off in range(0, n_rows, rows_per_chunk):
+            rows = slice(start + off, start + min(off + rows_per_chunk, n_rows))
+            lens_c = lens[off : off + rows_per_chunk]
+            s = indexer.scores(q[rows], index_k, weights[rows])
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+            idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+            reach = idx < lens_c[:, None]
+            if inputs.out_page_indices is not None:
+                inputs.out_page_indices[rows, :topk] = torch.where(
+                    reach, slots[idx.clamp_max(max_cols - 1)], -1
+                ).to(torch.int32)
+            inputs.out_raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(
+                torch.int32
+            )
+        start += n_rows
 
 
 def write_prefill(
