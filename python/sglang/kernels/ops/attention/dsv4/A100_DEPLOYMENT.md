@@ -650,6 +650,44 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### What the step looks like now, and the collective it is left with
+
+A fresh trace of the 3,890-token step after the head trim:
+
+| | calls | GPU ms |
+| --- | ---: | ---: |
+| all-reduce | 84 | 93.9 |
+| marlin MoE | 80 | 63.4 |
+| dense marlin | 321 | 41.8 |
+| hyper-connection chain | 402 | 36.8 |
+| long tail | 2,263 | 34.3 |
+| sparse MLA | 43 | 19.7 |
+| indexer top-k | 131 | 5.9 |
+| **total** | 3,324 | **295.8** |
+
+Sparse MLA fell from 66.6 to 19.7 ms, which is what the head trim bought. The
+collective is now the largest single item at 32% of the step.
+
+Two facts about it, both measured rather than assumed:
+
+- **No overlap at all.** Summing kernel durations gives 295.8 ms and so does the
+          union of their intervals across streams, i.e. the all-reduces are issued on a
+  comm stream but nothing ever runs beside them. They are on the critical path,
+  not hidden behind compute. In the same trace the step window holds 158 ms of
+  GPU idle, so the CPU is only just keeping up.
+- **Both in-tree implementations are latency algorithms.** The payload is the whole
+  hidden state, 3,890 x 5,120 bf16 = 38.8 MB, and it goes through
+  `all_reduce_2shot_pull` (or NCCL's `RING_LL`), which are tuned for small
+  messages. `--disable-custom-all-reduce` moves it to plain NCCL: prefill
+  0.306 -> **0.293 s**, but a decode step goes 23 -> 29.3 ms, because decode's
+  payload really is one row (10 KB) and the low-latency kernel is right there.
+  So the prefill win is a trade, not a free lunch: the size-aware dispatch that
+  should send 38.8 MB to NCCL and 10 KB to the custom kernel is not deciding
+  that way here, and fixing it is the next thing worth doing.
+
+Best measured on a 3,890-token single-stream prefill: **0.293 s, 13,272 tok/s**
+(with `--disable-custom-all-reduce`), against a 0.2598 s target.
+
 #### The sparse path was scoring 8x the heads this rank owns
 
 `q` reaches the attention backend padded to **64** heads, the shape the decode
