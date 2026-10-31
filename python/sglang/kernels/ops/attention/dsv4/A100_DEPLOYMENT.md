@@ -600,6 +600,56 @@ logits comparison against eager yet. The padded-column port is also slower per
 token than eager on a short prefix (`max_cols / real_lc` wasted scores), which is
 the same trade the plan predicted.
 
+#### Where the 322 ms step actually goes (fresh profile, one 3,853-token prefill)
+
+Duration sums from the profiler need the stream dimension before they can be read
+as a critical path, and on this backend that check is decisive: **every kernel of
+the step, communication included, runs on stream 100.** There is no compute/comm
+overlap to hide anything behind, so the shares are the critical path.
+
+| kernel | ms | share of busy |
+| --- | ---: | ---: |
+| `all_reduce_2shot_pull` (custom) | 84.6 | 22.3% |
+| `_sparse_mla_prefill_kernel` | 69.3 | 18.3% |
+| `marlin_moe` (routed experts) | 64.6 | 17.0% |
+| `marlin` (dense fp8 linears) | 51.5 | 13.6% |
+| `ncclDevKernel_AllReduce` | 26.7 | 7.0% |
+| `_hc_mix_stats_partial` | 25.2 | 6.6% |
+| `mhc_post_tilelang` | 8.0 | 2.1% |
+| `fill_` | 7.2 | 1.9% |
+| `_mhc_combine_kernel` | 5.2 | 1.4% |
+| `ampere_bf16_s16816gemm` (`wo_a`) | 4.9 | 1.3% |
+| `topk_sum` | 3.3 | 0.9% |
+
+3,890 kernel launches for one step -- 97 per layer -- and 291,947 Python events.
+
+The all-reduce is the largest single line and it is *not* a bandwidth number. The
+same 39.5 MB (hidden 5120 x 3853 tokens, bf16) measures **0.48 ms** standalone on
+this box but **2.11 ms** inside the step. The gap is spent spinning inside the
+kernel waiting for peers, so ~1.6 ms per layer, ~65 ms per step, is barrier wait
+rather than transfer. That also explains why `--boundary-reduction ar`, `rs` and
+`rs+rsv` all land within 6 ms of each other: they move the same bytes and pay the
+same wait, so the algorithm is not the variable.
+
+What the wait is *not* is compute imbalance. Per-rank totals over the same trace:
+
+- `marlin_moe` 59.4-66.5 ms (spread 7.1), `marlin` 42.8-47.3 (4.5),
+  `_sparse_mla_prefill` 63.0-70.9 (7.9) -- balanced to a few percent;
+- `all_reduce_2shot_pull` 2.5-84.6 ms and NCCL all-reduce 26.7-63.3 ms --
+  a 3x spread across ranks, and it moves to whichever rank arrived last.
+
+So the step is paced by `max(cpu_issue, gpu_busy)` with the two at parity
+(321 vs 322 ms), each rank's CPU work is identical in the mean but not in its
+instantaneous rate, and each of the 40 per-layer barriers charges the spread to
+every rank. Reaching 15,000 tok/s (66.7 us/token, 258 ms) therefore needs both
+halves: about 11% off CPU issue *and* the ~65 ms of wait gone. One mechanism does
+both -- a deterministic whole-body replay -- which is why the graph below matters
+more than any single kernel.
+
+No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
+`get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
+fuse-pattern table matches to this exact kernel triple is unavailable here.
+
 Avenues measured and closed, so they are not re-tried:
 
 - `--boundary-reduction ar` instead of `rs+rsv`: 0.343-0.346 s against 0.349,
