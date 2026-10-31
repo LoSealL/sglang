@@ -727,6 +727,17 @@ Two facts about it, both measured rather than assumed:
 Best measured on a 3,890-token single-stream prefill: **0.293 s, 13,272 tok/s**
 (with `--disable-custom-all-reduce`), against a 0.2598 s target.
 
+The narrow result has to be padded back afterwards. The tc-piecewise prefill graph
+allocates the attention output at capture time with the padded head count and then
+copies into it, so returning a narrow tensor trips its element-count assertion
+(`134217728 != 16777216`, exactly the 8x). `_pad_prefill_heads` restores the padded
+shape with zeros past the real heads, which is what those entries held before (zero
+queries), so it stays bit-identical and keeps the 8x saving -- 0.295 s against the
+0.293 s of the bare narrow version, i.e. inside the noise, with the shape contract
+intact. The breakable prefill graph still cannot capture for an unrelated reason (it
+also pins the token count: `4194304 != 52428`), which is the same pre-existing
+fixed-shape problem recorded earlier in this document.
+
 #### The sparse path was scoring 8x the heads this rank owns
 
 `q` reaches the attention backend padded to **64** heads, the shape the decode

@@ -4259,13 +4259,7 @@ class DeepseekV4AttnBackend(
                 and self.forward_metadata.late_layer_tail is None
                 and token_to_kv_pool.request_window is None
             ):
-                # ``q`` may arrive padded to 64 heads for the decode kernels'
-                # head specialization while this rank owns only
-                # ``layer.tp_q_head_num`` of them. The SM90/SM120 legs trim that
-                # pad; the portable Triton kernel accepts any head count, so it
-                # has to trim too or it scores eight times this rank's heads.
-                if q.shape[-2] > layer.tp_q_head_num:
-                    q = q[..., : layer.tp_q_head_num, :].contiguous()
+
                 if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
                     return self._forward_prefill_sparse_q8kv8(
                         q=q,
@@ -4276,8 +4270,22 @@ class DeepseekV4AttnBackend(
                         core_attn_metadata=core_attn_metadata,
                         attn_sink=attn_sink,
                     )
-                return self._forward_prefill_sparse(
-                    q=q,
+
+                # ``q`` arrives padded to the decode kernels' head specialization
+                # (64) while this rank owns only ``layer.tp_q_head_num`` of them,
+                # and the SM90/SM120 legs trim that pad before their kernel. Scoring
+                # all 64 makes Ampere do eight times the attention work it owes, so
+                # narrow the query for the kernel and pad the result back. Entries
+                # past ``n_real_heads`` used to be zero queries, so the answer is
+                # unchanged while the softmax only runs over the real heads.
+                n_real_heads = layer.tp_q_head_num
+                q_padded_heads = q.shape[-2]
+                o = self._forward_prefill_sparse(
+                    q=(
+                        q[..., :n_real_heads, :].contiguous()
+                        if q_padded_heads > n_real_heads
+                        else q
+                    ),
                     layer_id=layer_id,
                     compress_ratio=compress_ratio,
                     forward_batch=forward_batch,
@@ -4285,6 +4293,11 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
                     cos_sin_cache=cos_sin_cache,
+                )
+                return self._pad_prefill_heads(
+                    o,
+                    q_padded_heads=q_padded_heads,
+                    n_real_heads=n_real_heads,
                 )
 
             if cos_sin_cache is not None:
@@ -4429,6 +4442,14 @@ class DeepseekV4AttnBackend(
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _pad_prefill_heads(self, o, *, q_padded_heads: int, n_real_heads: int):
+        """Restore the padded head count the callers' buffers are shaped for."""
+        if q_padded_heads <= n_real_heads:
+            return o
+        buf = o.new_zeros((o.shape[0], q_padded_heads, o.shape[-1]))
+        buf[:, :n_real_heads, :] = o
+        return buf
 
     def _forward_prefill_sparse(
         self,
