@@ -709,11 +709,16 @@ collective is now the largest single item at 32% of the step.
 
 Two facts about it, both measured rather than assumed:
 
-- **No overlap at all.** Summing kernel durations gives 295.8 ms and so does the
-          union of their intervals across streams, i.e. the all-reduces are issued on a
-  comm stream but nothing ever runs beside them. They are on the critical path,
-  not hidden behind compute. In the same trace the step window holds 158 ms of
-  GPU idle, so the CPU is only just keeping up.
+- **Do not read overlap off a profiled trace.** Summing kernel durations gives
+  295.8 ms and so does the union of their intervals across streams, which looks like
+  "nothing ever overlaps". It is not: the profiled step window is 454-459 ms while the
+  same step measures 295 ms unprofiled, so the profiler is inflating and serializing
+  what it records. The per-rank kernel and collective durations in that trace are
+  inflated the same way (one rank shows 372 ms of "busy" inside a 306 ms step). Every
+  conclusion below that was cross-checked against an unprofiled TTFT is sound -- the
+  head trim removed 39 ms of profiled attention time and moved TTFT by 39 ms -- but
+  anything that rests only on the trace's overlap or idle figures has to be re-measured
+  with the profiler off.
 - **Both in-tree implementations are latency algorithms.** The payload is the whole
   hidden state, 3,890 x 5,120 bf16 = 38.8 MB, and it goes through
   `all_reduce_2shot_pull` (or NCCL's `RING_LL`), which are tuned for small
