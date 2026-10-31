@@ -56,23 +56,32 @@ Flags that are not optional on this hardware:
 
 ## Memory budget
 
-The checkpoint is 734.7 GiB on disk with a very uneven shape:
+The checkpoint is 475.2 GiB on disk, with a very uneven shape:
 
-| Component | GiB | Share |
-| --- | --- | --- |
-| Routed experts | 535.1 | 72.8% |
-| `embed` + `head` (bf16) | 190.1 | 25.9% |
-| Attention | 5.5 | 0.7% |
-| Everything else | 4.0 | 0.5% |
+| Component | GiB | Share | dtype |
+| --- | --- | --- | --- |
+| Routed experts (`w1/w2/w3`, 47,232 tensors) | 277.1 | 58.3% | `I8` + `F8_E8M0` (one scale per 32 values) |
+| Engram table, layer 1 | 91.6 | 19.3% | `F8_E4M3`, `[384006168, 256]` |
+| Engram table, layer 14 | 91.6 | 19.3% | `F8_E4M3`, `[384016682, 256]` |
+| Attention (`wq_a/wq_b/wkv/wo_a/wo_b/wqkv`) | 6.9 | 1.5% | `F8_E4M3` |
+| `head` + `embed_tokens` | 2.5 | 0.5% | bf16 |
+| Everything else | 2.0 | 0.4% | bf16 / f32 |
 
-Experts are `expert_dtype: fp4` on disk, so 267.6 GiB survive; the rest is
-unquantized bf16. That puts the resident set at ≈468 GiB, i.e. 58.6 GiB/card at
-TP8 and ≈21 GiB/card left for KV. TP4 does not fit.
+Measure these by summing the tensor byte ranges: the snapshot's `*.safetensors`
+are symlinks into the HF blob cache, so `du -sh` on the snapshot reports 224K
+while `du -shL` reports the real 476 GB.
 
-The 190 GiB of `embed`/`head` is the surprise: layers 1 and 14 each own an
-engram table of 384M rows × 256 fp8 values (plus a per-32 e8m0 scale), and
-`embed`/`head` themselves stay bf16. Any plan that assumes "the experts are the
-memory problem" will under-provision.
+The experts are **int8, not fp4** — `expert_dtype` is not set in this
+checkpoint; what is on disk is an `I8` payload with 32-wide `ue8m0` scales
+(`layers.0.ffn.experts.0.w1.scale` is `[2304, 160]`, i.e. 5120/32). Marlin keeps
+them packed, so the resident set is 72.79 GB/card at TP8 (`Load weight end. ...
+mem usage=72.79 GB`), not the 59.4 GiB a flat 1/8 of the checkpoint suggests.
+
+The 183 GiB of engram tables is the surprise: layers 1 and 14 each own a table
+of 384M rows × 256 fp8 values plus a per-32 e8m0 scale, and they are
+`nn.Parameter`s sharded **by row** over the TP group, so 22.9 GiB/card. Any plan
+that assumes "the experts are the memory problem" will under-provision — and
+these two tables are also the lever that makes 1M context fit (see "1M context").
 
 ## What changed in the tree
 
@@ -1227,6 +1236,75 @@ Faster collectives cannot help; the collectives are 1.5 ms of the 358. The
    scheme.
 
 The ceiling: dropping the 120 ms puts a 4,004-token prefill at 16.8k tok/s.
+
+## 1M context
+
+The model is built for it: `max_position_embeddings: 1048576`,
+`rope_scaling: {rope_type: yarn, factor: 16}` over
+`original_max_position_embeddings: 65536` (65536 × 16 = 1048576), and
+`sliding_window: 128`. Two things have to be right before it will serve.
+
+**1. The SWA pool ratio.** `--swa-full-tokens-ratio` defaults to `0.8`: for every
+full-KV token the scheduler also reserves 0.8 SWA tokens. With a 128-token
+window that is wildly over-provisioned — it raises the effective cost from
+1,630 B/token to ≈15 KB/token and pins `max_total_num_tokens` at 345,856 no
+matter what `--max-total-tokens` asks for. `--swa-full-tokens-ratio 0.01`
+restores `bytes_per_full_token=1864` and lets the pool hold the full 1,048,576.
+
+**2. The engram tables have to leave HBM.** With them resident the 1M pool
+(1.86 GB) and the ≈4.3 GB prefill working set do not both fit next to 67.8 GiB of
+weights, and *every* prefill OOMs — even a 2,048-token one, because the working
+set is roughly constant rather than proportional to the chunk:
+
+| `max_total_num_tokens` | free after pools | 2,048-token prefill |
+| --- | --- | --- |
+| 8,448 | 4.53 GB | OK (and up to ~7,015 tokens) |
+| 1,048,576 | 3.19 GB | OOM |
+
+Shrinking the chunk (`--chunked-prefill-size 2048`), the prefill batch
+(`--max-prefill-tokens 2048`) or dropping CUDA graphs all left the free memory at
+3.19 GB, so the two are mutually exclusive; the tables are what has to move.
+
+```bash
+export SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1
+export SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank  # the layout that gets huge pages
+...
+  --context-length 1048576 --max-total-tokens 1048576 \
+  --swa-full-tokens-ratio 0.01 --chunked-prefill-size 2048 \
+  --mem-fraction-static 0.95 --max-running-requests 1
+```
+
+The tables (183 GiB) go to host RAM and rows are gathered over PCIe; VRAM drops
+from 77,502 to 55,426 MiB/card, i.e. 22 GiB freed. Prefer `per_rank`: shmem THP
+is `never` on this box, so `shared` reports `0 MiB in huge pages` and the kernel
+logs "expect ~10x slower lookups", whereas `per_rank` reports
+`24168 MiB in huge pages (100%)` and is ~10% faster end to end. `per_rank` also
+needs the all-reduce per lookup. Load time grows from 90 s to 342 s while the
+tables are copied to host memory.
+
+Measured on 8×A100 with `per_rank`:
+
+| Input tokens | TTFT | tok/s |
+| --- | --- | --- |
+| 8,192 | 1.05 s | 7,816 |
+| 16,384 | 1.89 s | 8,662 |
+| 131,072 | 15.9 s | 8,259 |
+| 524,288 | 107.6 s | 4,873 |
+| 1,037,777 | 358.5 s | 2,895 |
+
+The last row is a needle test, not just a length test: "the secret access code is
+7391" sits at token ~1,030 and the question at the end, 1,036,747 tokens apart.
+The model answers `7391`. Peak VRAM 61.8 GB/card (~20 GB spare).
+
+The maximum accepted input is **1,048,569** tokens; 1,048,570 is rejected with
+`exceeds the maximum allowed length (1048570)`, i.e. six tokens are held back
+for decode. Anything longer needs `--allow-auto-truncate`.
+
+Prefill throughput falls off past ~128K because the DSA indexer scores every
+chunk against the whole prefix, so 1M costs ≈3.5× the per-token time of 128K.
+The host tables also cost against the in-HBM baseline: the 6,144-token best case
+is 15,789 tok/s, vs 8,662 at 16,384 with the tables in host RAM — that ~22 GiB is
+the price.
 
 ## Tests
 
