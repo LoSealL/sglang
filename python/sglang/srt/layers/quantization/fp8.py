@@ -1288,7 +1288,40 @@ class Fp8LinearMethod(LinearMethodBase):
                 _amx_process_weight_after_loading(layer, ["weight"])
                 return
 
-        if self.use_marlin and _marlin_can_cover(layer):
+        # SGLANG_FP8_DENSE_BF16: on a device without fp8 hardware the block-quantized
+        # weights are dequantized to bf16 for Marlin, an INT4 kernel. For prefill-width
+        # batches a plain bf16 cuBLAS GEMM is about twice as fast at the shapes this
+        # model uses (137 vs 73 TFLOPS on A100); for decode's one-row batches Marlin
+        # wins, by measured 3 ms per step on DeepSeek-V4.1, so this trades decode for
+        # prefill and is therefore off by default.
+        #
+        # The dequantized copy is built here, before the KV pool is sized: doing it
+        # lazily inside the first forward allocates it against an already-sized pool
+        # and OOMs, and it costs enough memory that the pool must be sized knowing
+        # about it (mem-fraction-static has to rise by ~0.02).
+        if (
+            self.block_quant
+            and get_platform().is_sm80
+            and get_bool_env_var("SGLANG_FP8_DENSE_BF16")
+        ):
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+
+            weight_bf16 = block_quant_dequant(
+                layer.weight,
+                layer.weight_scale_inv,
+                self.weight_block_size,
+                torch.bfloat16,
+            )
+            # Replace the fp8 weight instead of keeping both: Marlin's repack is a
+            # bf16 copy too, so this keeps the footprint at the same two bytes per
+            # parameter the Marlin path uses.
+            layer.weight = Parameter(weight_bf16, requires_grad=False)
+            layer.register_buffer(
+                "_block_fp8_bf16_weight", weight_bf16, persistent=False
+            )
+            del layer.weight_scale_inv
+            del layer.input_scale
+        elif self.use_marlin and _marlin_can_cover(layer):
             if self.block_quant:
                 layer.weight_block_size = self.quant_config.weight_block_size
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)

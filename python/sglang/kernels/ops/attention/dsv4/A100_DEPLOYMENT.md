@@ -650,6 +650,30 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### The dense GEMMs moved off Marlin, and prefill gained 5%
+
+`SGLANG_FP8_DENSE_BF16=1` builds the dequantized bf16 copy in
+`process_weights_after_loading` (so the KV pool is sized knowing about it), replaces the
+fp8 weight with it -- Marlin's repack is a bf16 copy too, so the footprint stays at two
+bytes per parameter -- and lets the layer take the cached-bf16 `torch.matmul` path:
+
+| 3,890-token prefill | TTFT | tok/s |
+| --- | ---: | ---: |
+| Marlin dense (default) | 0.296 s | 13,141 |
+| dequantized bf16 dense | **0.280 s** | **13,873** |
+
+Identical output on the probe prompt (`= **28**` on both), and the default path is
+unchanged when the variable is unset. Two costs come with it, both measured: a decode
+step goes 23 -> 26.1 ms, because one-row batches are exactly what the INT4 kernel is
+good at, and the KV pool has to shrink a little (mem-fraction-static 0.95 -> 0.97 with
+`--max-total-tokens 4608` instead of 8192). The launch line that gets 13,873 tok/s is
+
+    SGLANG_FP8_DENSE_BF16=1 ... --max-total-tokens 4608 --mem-fraction-static 0.97
+
+Dispatch per batch width (cuBLAS above a few hundred rows, Marlin below) would keep both
+wins and needs the two weight formats resident at once, about one more byte per dense
+parameter; that is the remaining follow-up here.
+
 #### The dense GEMMs are running on the wrong kernel
 
 Of the 41.8 ms the dense marlin GEMMs take, roughly half is avoidable. Marlin is an
