@@ -650,6 +650,35 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### 80 device synchronizations per prefill step, for a union nothing needed
+
+A prefill step of 3,890 tokens carried 116 host synchronizations, 180.8 ms of them by
+the CPU's own clock: 80 came from `torch.unique` inside `_forward_decode_sparse_sm80`
+(two per layer, since prefill reaches that function too) and 32 from the indexer's
+`unique_consecutive`. `torch.unique` has to read its output length back from the
+device, so each call drains the queue; that is why the step looked neither CPU-bound
+nor GPU-bound and sat at a suspiciously stable ~340 ms either way.
+
+The union existed only to make the dequantized KV workspace compact. A slot index can
+serve as its own workspace row instead: `SparsePrefillWorkspace` now holds one row per
+pool slot, the whole slot range is dequantized once, and `swa_remap = where(valid,
+slot, -1)` replaces the inverse permutation. Invalid lanes are dropped exactly as
+before, dequantization per slot is unchanged, so the result is bit-identical -- checked
+against the legacy path on a fixed prompt, same text, and the bound `max(slot) < pages
+x page_size` was asserted for prefill, decode and warmup shapes (26,112 SWA slots,
+4,352/8,448 extra slots). The workspace costs a few tens of MB per layer, a small
+fraction of the attention that follows it.
+
+| 3,890-token prefill | TTFT | tok/s |
+| --- | ---: | ---: |
+| union + 116 host syncs | 0.339 s | 11,478 |
+| slot-indexed workspace | **0.331 s** | **11,747** |
+
+Worth stating plainly: the 80 syncs cost only 8 ms of wall, not the 120 ms their
+duration suggests, because the GPU kept working through most of them. What remains is
+that the step is genuinely GPU-bound at ~340 ms, and the target of 259 ms still needs
+~72 ms out of kernels.
+
 #### Decode graphs were impossible here, and they cost 6.7x per decode step
 
 `_forward_decode_sparse_sm80` dequantized only the *union* of referenced KV slots,

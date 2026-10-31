@@ -4563,6 +4563,13 @@ class DeepseekV4AttnBackend(
         # dequantizer wants one byte row per page instead, carrying the pool's
         # own page stride so the A100 reader addresses the same bytes that the
         # FlashMLA path (and a PD peer) does.
+        # One workspace row per pool slot bounds the dequantized range without
+        # consulting the device, and lets a slot index double as its row.
+        swa_page_size = token_to_kv_pool.get_swa_key_page_size()
+        swa_slot_count = swa_k_cache.shape[0] * swa_page_size
+        extra_slot_count = (
+            extra_k_cache.shape[0] * extra_page_size if build_extra else 0
+        )
         swa_k_cache = _paged_byte_rows(swa_k_cache)
         if build_extra:
             extra_k_cache = _paged_byte_rows(extra_k_cache)
@@ -4574,56 +4581,39 @@ class DeepseekV4AttnBackend(
             flash_mla_sparse_prefill_triton,
         )
 
-        # Dequantize only the union of referenced slots into one bf16
-        # workspace and run the portable Triton sparse-MLA kernel on it. The
-        # paged dequantizer is the primitive the SM90/SM120 paths share, and
-        # writing the two segments back-to-back gives the row order the kernel
-        # expects: SWA window first, compressed rows second.
-        # torch.unique cannot run under CUDA graph capture, and the union it
-        # returns is a data-dependent length that would have to become a graph
-        # constant. A captured decode therefore dequantizes the referenced slots
-        # in reference order instead: duplicates inside a query's own list do not
-        # occur (a window is contiguous and a top-k selects distinct positions),
-        # the same slot serving two queries only costs a redundant row, and
-        # invalid lanes are dropped by the -1 remap exactly as before. `numel` is
-        # a static shape here, so it stays a Python int either way.
-        capture_safe = torch.cuda.is_current_stream_capturing()
-        if capture_safe:
-            n_swa = swa_idx.numel()
-            swa_slots = torch.where(swa_valid, swa_idx, 0).reshape(-1)
-            swa_inv = torch.arange(n_swa, device=swa_idx.device)
-            extra_slots = extra_inv = None
-        else:
-            swa_slots, swa_inv = torch.unique(
-                torch.where(swa_valid, swa_idx, 0).reshape(-1), return_inverse=True
-            )
-            n_swa = swa_slots.numel()
+        # Dequantize a bounded slot range into one bf16 workspace and run the
+        # portable Triton sparse-MLA kernel on it. The paged dequantizer is the
+        # primitive the SM90/SM120 paths share, and writing the two segments
+        # back-to-back gives the row order the kernel expects: SWA window first,
+        # compressed rows second.
+        #
+        # A slot index *is* its workspace row, so no union of referenced slots has
+        # to be computed. torch.unique would sync the device once per call to learn
+        # its output length -- twice per layer per step, which is the largest
+        # host-side stall in a prefill step, and it cannot be captured at all.
+        # Dequantizing the pool's whole slot range instead reads a few tens of MB
+        # per layer, under 2% of what the attention that follows it costs, and
+        # invalid lanes are still dropped by the -1 remap.
+        n_swa = swa_slot_count
+        swa_slots = torch.arange(n_swa, device=swa_idx.device, dtype=torch.int32)
+        n_extra = extra_slot_count
         if build_extra:
-            if capture_safe:
-                n_extra = extra_idx.numel()
-                extra_slots = torch.where(extra_valid, extra_idx, 0).reshape(-1)
-                extra_inv = torch.arange(n_extra, device=extra_idx.device)
-            else:
-                extra_slots, extra_inv = torch.unique(
-                    torch.where(extra_valid, extra_idx, 0).reshape(-1),
-                    return_inverse=True,
-                )
-                n_extra = extra_slots.numel()
-        else:
-            n_extra = 0
+            extra_slots = torch.arange(
+                n_extra, device=extra_idx.device, dtype=torch.int32
+            )
 
         workspace = self.sparse_decode_workspace.get(n_extra + n_swa)
         dequantize_k_cache_paged_dsv4(
             swa_k_cache,
-            swa_slots.to(torch.int32),
-            page_size=token_to_kv_pool.get_swa_key_page_size(),
+            swa_slots,
+            page_size=swa_page_size,
             out=workspace[:n_swa],
             layout=token_to_kv_pool.get_swa_key_layout(),
         )
         if build_extra:
             dequantize_k_cache_paged_dsv4(
                 extra_k_cache,
-                extra_slots.to(torch.int32),
+                extra_slots,
                 page_size=extra_page_size,
                 out=workspace[n_swa:],
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
@@ -4632,14 +4622,10 @@ class DeepseekV4AttnBackend(
         # Rebase the per-query indices onto the workspace. Unused slots keep the
         # -1 sentinel: the kernel drops them rather than reading slot 0, which
         # holds decompressed-but-unreferenced data.
-        swa_remap = torch.where(
-            swa_valid, swa_inv.reshape(num_q, -1).to(torch.int32), -1
-        )
+        swa_remap = torch.where(swa_valid, swa_idx.to(torch.int32), -1)
         if build_extra:
             extra_remap = torch.where(
-                extra_valid,
-                extra_inv.reshape(num_q, -1).to(torch.int32) + n_swa,
-                -1,
+                extra_valid, extra_idx.to(torch.int32) + n_swa, -1
             )
             combined_idx = torch.cat([swa_remap, extra_remap], dim=1)
             # Past the live prefix the compressed lanes hold stale indexer
