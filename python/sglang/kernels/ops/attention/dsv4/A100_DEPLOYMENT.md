@@ -650,6 +650,45 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### The collective is not slow. It is measuring rank skew.
+
+The last entry left the all-reduce as the step's largest item and blamed its
+bandwidth. Measuring the payloads and the peers says otherwise.
+
+The payloads are real and large: instrumenting both collective paths shows in-place
+all-reduce calls of **39.83 MB** (3,890 x 5,120 bf16, the whole hidden state) and
+**47.80 MB** (the hyper-connection-expanded width), 43 calls in a step, out-of-place
+ones of 1.31/1.98/2.37 MB. So the bytes are as expected -- and the timing is not:
+
+| measurement | 39.8 MB all-reduce |
+| --- | ---: |
+| raw `dist.all_reduce`, 8 ranks, tight loop | 0.497 ms (80 GB/s) |
+| the same collective inside a prefill step | 2.04 ms (20 GB/s) |
+
+The links are not the limit either: NV12 to every peer (12 x 25 GB/s) with CUDA peer
+access enabled on all 56 pairs, and a GPU0 -> GPU1 copy of 256 MB sustaining
+234 GB/s. `--enable-nccl-nvls`, `NCCL_PROTO=Simple`, `NCCL_ALGO=Tree` and
+`--disable-custom-all-reduce` all land within 3 ms of each other, because the
+collective is not the thing being measured.
+
+Per rank traces of one step show what is:
+
+| rank | step window | kernels | GPU busy | AR time |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 454.2 ms | 3,324 | 295.8 ms | 6.1 ms |
+| 3 | 459.2 ms | 3,307 | 371.9 ms | 68.9 ms |
+| 5 | 449.8 ms | 3,307 | 323.9 ms | 84.2 ms |
+| 7 | 459.0 ms | 3,323 | 302.6 ms | 3.4 ms |
+
+Every rank finishes at the same wall (~455 ms) but their compute differs by 76 ms, and
+the all-reduce kernel duration is almost exactly the complement: the ranks that finish
+their layer early sit inside the collective spinning for the ones that have not. A
+200 us/rank delay injected before a raw collective moves it from 0.50 to 0.67-1.40 ms,
+which is the same mechanism at small scale. **The 87.7 ms attributed to the collective
+is rank imbalance being observed at a rendezvous point**, so swapping algorithms,
+protocols or NVLS cannot recover it; the per-layer compute skew (~1.9 ms per layer) has
+to come down instead.
+
 #### What the step looks like now, and the collective it is left with
 
 A fresh trace of the 3,890-token step after the head trim:
