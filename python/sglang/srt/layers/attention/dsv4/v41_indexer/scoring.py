@@ -394,9 +394,11 @@ def prefill_graph_scores(
     lens_all = metadata.compressed_seq_lens
     topk = min(indexer.index_topk, max_cols)
     j = torch.arange(max_cols, device=q.device)
-    rows_per_chunk = max(
-        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * max_cols * 2)
-    )
+    # A captured forward retains every allocation in the graph's private pool, so
+    # the eager 1 GiB score budget would reserve tens of megabytes per layer for
+    # the whole life of the graph -- 40 layers of that does not fit beside the KV
+    # pool. 64 MiB keeps the score tile well inside L2 and the pool small.
+    rows_per_chunk = max(1, (1 << 26) // (q.shape[1] * max_cols * 2))
 
     inputs.out_raw_indices.fill_(-1)
     if inputs.out_page_indices is not None:
@@ -411,7 +413,12 @@ def prefill_graph_scores(
         # page-table entries this request never wrote, indexing the index-K
         # pool out of range. Slot 0 is always valid and those columns are
         # masked to -inf before the selection, so this is unobservable.
-        raw = req_to_token[request_row[start], j * ratio].to(torch.int64) // ratio
+        # Two gathers rather than req_to_token[row, cols]: mixing a 0-dim index
+        # with a vector one is a capture-illegal advanced index.
+        page_row = torch.index_select(
+            req_to_token, 0, request_row[start].reshape(1)
+        ).squeeze(0)
+        raw = page_row.index_select(0, j * ratio).to(torch.int64) // ratio
         slots = torch.where(j < lens.max(), raw, torch.zeros_like(raw))
         index_k = token_to_kv_pool.get_low_ratio_index_k_dequant(
             inputs.layer_id, slots

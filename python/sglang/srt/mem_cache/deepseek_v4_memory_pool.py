@@ -566,6 +566,25 @@ def dsv41_index_page_size() -> int:
 DSV41_INDEX_PAGE_SIZE = dsv41_index_page_size()
 
 
+_DEQUANT_TABLE_BY_DEVICE: dict = {}
+
+
+def _dequant_table(device: torch.device) -> torch.Tensor:
+    """The fp4 codebook, resident on `device`.
+
+    It used to be `.to(buf.device)` inside the readback, which is a host to device
+    copy on every call: cheap once the tensor is already there, but a capture of
+    the prefill forward cannot perform it at all unless the source is pinned. A
+    per-device cache keeps the copy out of the captured region."""
+    table = _DEQUANT_TABLE_BY_DEVICE.get(device)
+    if table is None:
+        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
+
+        table = DSV4_DEQUANT_FP4_TABLE.to(device)
+        _DEQUANT_TABLE_BY_DEVICE[device] = table
+    return table
+
+
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
@@ -794,8 +813,6 @@ class DeepSeekV4IndexerPool(KVCache):
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Dequantized bf16 [n, index_head_dim] index K; `slots` None reads the pool."""
-        from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
-
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
@@ -810,9 +827,7 @@ class DeepSeekV4IndexerPool(KVCache):
         )
         u = buf[page, payload_cols].view(torch.uint8)  # [n, 64]
         codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
-        vals = DSV4_DEQUANT_FP4_TABLE.to(buf.device)[codes.long()].flatten(
-            1
-        )  # [n, 128]
+        vals = _dequant_table(buf.device)[codes.long()].flatten(1)  # [n, 128]
         exps = buf[page, scale_cols].to(torch.int32) & 0xFF  # [n, 4]
         scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
         return (vals * scales).to(torch.bfloat16)

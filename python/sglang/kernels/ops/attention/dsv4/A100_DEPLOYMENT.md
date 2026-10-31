@@ -650,6 +650,44 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### The whole-body prefill graph captures now, and what that exposed
+
+Four capture-illegal operations stood between `--cuda-graph-backend-prefill full`
+and a captured prefill. All four are fixed and the server starts with the graph
+backend on:
+
+- the candidate-block `assert` in `_low_ratio_index_topk_graph`: a captured
+  forward now scores the full width at every low-ratio source instead of
+  publishing a DeepGEMM fp4 block table;
+- `req_to_token[row, cols]` with a zero-dim row index, which is a capture-illegal
+  advanced index -- replaced by two `index_select` gathers;
+- `DSV4_DEQUANT_FP4_TABLE.to(device)` inside the index-K readback, a host to device
+  copy on every call; the codebook is now cached per device;
+- the eager 1 GiB score budget in `prefill_graph_scores`, which reserved tens of
+  megabytes per layer in the graph's private pool; a captured forward uses 64 MiB.
+
+The graph then turned out to be **unreachable for a real prompt**, for a reason
+worth writing down: `can_replay_locally` refuses any V4.1 batch whose
+`padded_num_tokens != num_tokens`, so a replay needs a step of *exactly* one bucket
+size. With a 4096 bucket and `--context-length 4096` a 4096-token prompt cannot even
+be sent (no room for the output token), and the log confirms every real request ran
+`cuda graph: False`. Raising the context to make one reachable moves the collision
+to memory: capturing a 4096-token bucket leaves the KV pool `0.16 GB` at
+`--mem-fraction-static 0.93`, and the run dies in pool construction.
+
+Two measurements came out of the attempt, and the second is the important one.
+
+- Steps that do not replay still take the graph-shaped code path under
+  `--cuda-graph-backend-prefill full`, so they pay the full-width scorer for
+  nothing: **0.489 s at 3,897 tokens against 0.348 s on the baseline config**. The
+  full-graph backend as it stands is a 40% loss, not a win.
+- That 0.489 versus 0.348 is the cleanest measurement of one thing yet: **the
+  candidate block scheme is worth ~150 ms of a 3,900-token step.** The indexer's
+  full-width top-k over 4,096 compressed positions per layer costs more than the
+  launch overhead the graph removes. Until `publish_prefill_table` has a torch
+  port on Ampere, a captured prefill cannot be faster than the eager candidate
+  path, and the graph is not the way to 15,000 tok/s on its own.
+
 #### The step is paced by launch count, not by any kernel (measured)
 
 A TTFT sweep settles what the profile could not. Sweeping prompt length on the

@@ -3881,9 +3881,13 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no prefill graph indexer plan for {ratio = }"
-        assert not indexer.uses_candidates, (
-            "candidate blocks are not wired into the whole-body prefill graph"
-        )
+        # The candidate scheme needs a published block table, and publishing it is
+        # DeepGEMM fp4 on SM100 (`publish_prefill_table` -> score_tiles over block
+        # representatives). Rather than delay the graph on a torch port of that,
+        # a captured forward scores the full width at every low-ratio source: the
+        # exact top-k that the block window approximates. That is a numerical
+        # change on candidate consumer layers, so compare logits against eager
+        # before trusting a captured run for anything but timing.
         core = self.forward_metadata.core_metadata
         inputs = CapturedPrefillInputs(
             indexer=indexer,
