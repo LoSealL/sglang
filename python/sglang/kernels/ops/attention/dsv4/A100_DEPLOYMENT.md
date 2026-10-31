@@ -732,16 +732,22 @@ Two facts about it, both measured rather than assumed:
 Best measured on a 3,890-token single-stream prefill: **0.293 s, 13,272 tok/s**
 (with `--disable-custom-all-reduce`), against a 0.2598 s target.
 
-The narrow result has to be padded back afterwards. The tc-piecewise prefill graph
+The narrow result has to be padded back afterwards. The piecewise prefill graph
 allocates the attention output at capture time with the padded head count and then
 copies into it, so returning a narrow tensor trips its element-count assertion
 (`134217728 != 16777216`, exactly the 8x). `_pad_prefill_heads` restores the padded
-shape with zeros past the real heads, which is what those entries held before (zero
-queries), so it stays bit-identical and keeps the 8x saving -- 0.295 s against the
-0.293 s of the bare narrow version, i.e. inside the noise, with the shape contract
-intact. The breakable prefill graph still cannot capture for an unrelated reason (it
-also pins the token count: `4194304 != 52428`), which is the same pre-existing
-fixed-shape problem recorded earlier in this document.
+shape with zeros past the real heads -- what those entries held before the trim, zero
+queries -- so it stays bit-identical and keeps the 8x saving. It is shape-agnostic on
+purpose: the prefill leg returns rank 3 and the decode leg rank 4 with the group
+dimension kept, and both put the heads at `-2`.
+
+With that in place `--cuda-graph-backend-prefill breakable --cuda-graph-bs-prefill 4096
+--cuda-graph-prefill-max-context 4096` captures and replays a 3,890-token prefill
+(it could not before: the same head-pad assertion fired during capture). It changes
+nothing: 0.296 s against 0.295-0.298 s eager. That is worth knowing precisely because
+it was the last open hypothesis -- replacing 3,324 launches with graph replay moves
+nothing, so the step is GPU-bound and the launch overhead is already hidden. Any
+further progress has to come from doing less GPU work, not from issuing it faster.
 
 #### The sparse path was scoring 8x the heads this rank owns
 

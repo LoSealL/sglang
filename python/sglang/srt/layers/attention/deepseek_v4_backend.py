@@ -4380,18 +4380,20 @@ class DeepseekV4AttnBackend(
                 # sparse decode raises "Unsupported architecture" on Ampere.
                 # Dequantize the paged fp8 cache into a bf16 workspace and run
                 # the portable Triton sparse-MLA kernel instead.
-                import os as _os2
-
-                if _os2.environ.get("SGLANG_QH_LOG"):
-                    print(
-                        f"qh layer={layer_id} tp_q_head_num={layer.tp_q_head_num} "
-                        f"q={tuple(q.shape)} mode={forward_batch.forward_mode}",
-                        flush=True,
-                    )
-                if q.shape[-2] > layer.tp_q_head_num:
-                    q = q[..., : layer.tp_q_head_num, :].contiguous()
-                o = self._forward_decode_sparse_sm80(
-                    q=q,
+                # Same 64-head pad as the prefill leg: the decode kernels are
+                # specialized for the padded count while this rank owns only
+                # ``layer.tp_q_head_num``, so score the owned heads and restore
+                # the padded width afterwards (the entries past it were zero
+                # queries, and the callers' output buffers are shaped for it).
+                n_real_heads = layer.tp_q_head_num
+                q_padded_heads = q.shape[-2]
+                o = self._pad_prefill_heads(
+                    self._forward_decode_sparse_sm80(
+                        q=(
+                            q[..., :n_real_heads, :].contiguous()
+                            if q_padded_heads > n_real_heads
+                            else q
+                        ),
                     layer_id=layer_id,
                     compress_ratio=compress_ratio,
                     swa_k_cache=swa_k_cache,
@@ -4402,9 +4404,12 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths=extra_topk_lengths,
                     attn_sink=attn_sink,
                     token_to_kv_pool=token_to_kv_pool,
-                    positions=match_num_queries(
-                        core_attn_metadata.positions, value=0
+                        positions=match_num_queries(
+                            core_attn_metadata.positions, value=0
+                        ),
                     ),
+                    q_padded_heads=q_padded_heads,
+                    n_real_heads=n_real_heads,
                 )
             else:
                 if _is_xpu:
@@ -4444,11 +4449,16 @@ class DeepseekV4AttnBackend(
         raise NotImplementedError("ragged attention")
 
     def _pad_prefill_heads(self, o, *, q_padded_heads: int, n_real_heads: int):
-        """Restore the padded head count the callers' buffers are shaped for."""
+        """Restore the padded head count the callers' buffers are shaped for.
+
+        Shape-agnostic: the decode leg returns a rank-4 tensor with the group
+        dimension kept, the prefill leg a rank-3 one, and both put the heads at
+        ``-2``.
+        """
         if q_padded_heads <= n_real_heads:
             return o
-        buf = o.new_zeros((o.shape[0], q_padded_heads, o.shape[-1]))
-        buf[:, :n_real_heads, :] = o
+        buf = o.new_zeros(o.shape[:-2] + (q_padded_heads, o.shape[-1]))
+        buf[..., :n_real_heads, :] = o
         return buf
 
     def _forward_prefill_sparse(
