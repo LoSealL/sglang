@@ -23,6 +23,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     with_phase,
 )
 from sglang.srt.utils.common import (
+    get_bool_env_var,
     parse_connector_type,
 )
 
@@ -198,6 +199,11 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             lambda: (
                 is_deepseek_v4(model_config_of(server_args).hf_config)
                 and not supports_prefill_cp_bcg(server_args)
+                # Opt-in override for measurement: the scratch buffers that made
+                # this OOM have since moved out of the captured region (the fp4
+                # codebook is resident and the score tile is capped), so this is
+                # worth re-testing. Default stays off until a run proves it.
+                and not get_bool_env_var("SGLANG_DSV4_ALLOW_BCG")
             ),
         ),
         # CP all_gather replay size mismatch under BCG. Defer the warning until

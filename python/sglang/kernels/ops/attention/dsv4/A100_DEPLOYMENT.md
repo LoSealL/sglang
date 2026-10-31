@@ -650,6 +650,41 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### Both prefill graph backends now replay, and the answer is GPU time
+
+With the field-list fix below, a V4.1 prefill replays under both backends -- the
+log line reads `cuda graph: True` -- provided the step is exactly one bucket wide.
+Three costs at the same 4096-token bucket, same server settings:
+
+| prefill path | TTFT (s) | what it says |
+| --- | ---: | --- |
+| eager, candidate block scheme | ~0.365 | the baseline |
+| **breakable replay** | **0.352** | capture is worth 13 ms |
+| full replay, full-width indexer | 0.594 | the indexer is worth far more |
+
+`PagedIndexerMetadata.copy_` had a hard-coded field list that the three plan
+fields added for the captured scorer were never added to, so a breakable replay
+refresh asserted on the field sets before it could replay; that is the fix that
+made the middle row measurable.
+
+The middle row is the important one. **Capturing the body of every layer, with
+attention left eager, saves 13 ms of a 352 ms step.** So at 3,900-4,096 tokens this
+step is not launch-bound and not python-bound: it is GPU-bound, and the ~330 ms of
+kernel work is the budget. The 169 ms launch floor measured on short prompts is a
+short-prompt phenomenon -- the CPU issue cost overlaps with the GPU once there is
+enough compute to hide it behind.
+
+The third row sizes the other term. Running every low-ratio source at full width
+instead of through the candidate block table costs **240 ms**, five times what
+capture saves, which is why a captured prefill cannot be made faster by capture
+alone on this GPU: the candidate scheme is what keeps the indexer off the critical
+path, and it must be ported before a captured path can pay.
+
+That leaves the arithmetic of the goal in one line. 15,000 tok/s at 3,900 tokens is
+259 ms; the step's GPU work is ~300 ms once the custom all-reduce overlaps; so the
+remaining ~40 ms has to come out of kernels -- the sparse MLA prefill (69 ms at
+58% of HBM peak, ~28 ms of headroom) and the two marlin MoE GEMMs (65 + 47 ms).
+
 #### The whole-body prefill graph captures now, and what that exposed
 
 Four capture-illegal operations stood between `--cuda-graph-backend-prefill full`

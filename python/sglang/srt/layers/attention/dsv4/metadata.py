@@ -387,6 +387,13 @@ class PagedIndexerMetadata:
             "rows_per_chunk",
             "mqa_logits_budget_bytes",
             "topk_metadata_chunks",
+            # Read by the captured prefill scorer. A replay refresh rebinds them
+            # instead of copying tensor contents: request_row_blocks and
+            # max_compressed_cols are plain Python values, and request_row_of_row
+            # is rebuilt for the replay's request layout.
+            "request_row_blocks",
+            "max_compressed_cols",
+            "request_row_of_row",
         ]
         copy_metadata(
             src=other,
