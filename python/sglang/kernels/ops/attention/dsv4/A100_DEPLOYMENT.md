@@ -650,6 +650,45 @@ No free comm fusion exists on ampere: `flashinfer_comm_fusion` gates on
 `get_platform().is_sm90`, so the TP all-reduce + residual + RMSNorm path that the
 fuse-pattern table matches to this exact kernel triple is unavailable here.
 
+#### Decode graphs were impossible here, and they cost 6.7x per decode step
+
+`_forward_decode_sparse_sm80` dequantized only the *union* of referenced KV slots,
+so it called `torch.unique(..., return_inverse=True)` and sized the workspace from
+`swa_slots.numel()`. `torch.unique` syncs the device to learn its output length, so
+the decode path could not be captured at all -- which is why every config in this
+document disabled decode graphs. A capture now takes the dedup-free route: slots are
+dequantized in reference order, where a duplicate slot only costs a redundant row
+and invalid lanes are still dropped by the `-1` remap. The eager path keeps the
+union, so nothing changes without capture.
+
+Measured on a one-token-per-step decode, `max_new_tokens=1` against `=5`:
+
+| decode | per decode step |
+| --- | ---: |
+| eager (torch.unique + 96 host syncs) | 154 ms |
+| captured | **23 ms** |
+
+Two more numbers came out of the same measurements, and they close the question of
+what TTFT actually contains:
+
+- **TTFT does not include a decode step.** Making decode 6.7x faster left TTFT at
+  0.338 s for 3,890 tokens, unchanged.
+- With the step annotations in a trace, the prefill step's own numbers are
+  `step[EXTEND bs=1 toks=3792]`: 3,857 kernels and **367.7 ms of GPU time**, against
+  a 0.334 s TTFT. So a single-stream prefill of 3,900 tokens is *exactly* GPU-bound
+  (~368 ms of kernel work, and profiling inflates it by about the same margin), and
+  the fixed ~169 ms that shows up on short prompts is the launch cost that has no
+  compute to hide behind.
+
+That fixes the target precisely: 15,000 tok/s at 3,900 tokens is 259 ms, so ~110 ms
+of the 368 has to come out of kernels. The kernel budget of that step, per launch
+count and time, is 110 ms of collectives (40 custom `all_reduce_2shot_pull` at
+1.83 ms plus 43 NCCL at 0.85, every payload the full hidden state), 67 ms of sparse
+MLA prefill, 63 ms of marlin MoE, 46 ms of dense marlin, 25 ms of hyper-connection
+stats, and ~30 ms over the tail of small kernels. `--moe-runner-backend triton`
+is not an option for this checkpoint: the routed experts are fp4 and that backend
+rejects the layout, leaving marlin as the only Ampere GEMM path.
+
 #### Both prefill graph backends now replay, and the answer is GPU time
 
 With the field-list fix below, a V4.1 prefill replays under both backends -- the

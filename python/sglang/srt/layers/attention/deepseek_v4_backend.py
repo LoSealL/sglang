@@ -4579,16 +4579,36 @@ class DeepseekV4AttnBackend(
         # paged dequantizer is the primitive the SM90/SM120 paths share, and
         # writing the two segments back-to-back gives the row order the kernel
         # expects: SWA window first, compressed rows second.
-        swa_slots, swa_inv = torch.unique(
-            torch.where(swa_valid, swa_idx, 0).reshape(-1), return_inverse=True
-        )
-        n_swa = swa_slots.numel()
-        if build_extra:
-            extra_slots, extra_inv = torch.unique(
-                torch.where(extra_valid, extra_idx, 0).reshape(-1),
-                return_inverse=True,
+        # torch.unique cannot run under CUDA graph capture, and the union it
+        # returns is a data-dependent length that would have to become a graph
+        # constant. A captured decode therefore dequantizes the referenced slots
+        # in reference order instead: duplicates inside a query's own list do not
+        # occur (a window is contiguous and a top-k selects distinct positions),
+        # the same slot serving two queries only costs a redundant row, and
+        # invalid lanes are dropped by the -1 remap exactly as before. `numel` is
+        # a static shape here, so it stays a Python int either way.
+        capture_safe = torch.cuda.is_current_stream_capturing()
+        if capture_safe:
+            n_swa = swa_idx.numel()
+            swa_slots = torch.where(swa_valid, swa_idx, 0).reshape(-1)
+            swa_inv = torch.arange(n_swa, device=swa_idx.device)
+            extra_slots = extra_inv = None
+        else:
+            swa_slots, swa_inv = torch.unique(
+                torch.where(swa_valid, swa_idx, 0).reshape(-1), return_inverse=True
             )
-            n_extra = extra_slots.numel()
+            n_swa = swa_slots.numel()
+        if build_extra:
+            if capture_safe:
+                n_extra = extra_idx.numel()
+                extra_slots = torch.where(extra_valid, extra_idx, 0).reshape(-1)
+                extra_inv = torch.arange(n_extra, device=extra_idx.device)
+            else:
+                extra_slots, extra_inv = torch.unique(
+                    torch.where(extra_valid, extra_idx, 0).reshape(-1),
+                    return_inverse=True,
+                )
+                n_extra = extra_slots.numel()
         else:
             n_extra = 0
 
