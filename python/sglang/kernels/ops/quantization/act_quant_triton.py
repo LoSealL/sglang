@@ -83,6 +83,23 @@ def _act_quant_kernel(
     tl.store(s_ptrs, scale, mask=s_mask)
 
 
+def _act_quant_aten(
+    x: torch.Tensor, block_size: int, scale_fmt: Optional[str]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """SM80 fallback for _act_quant_kernel (no fp8e4nv in triton on sm80)."""
+    N = x.size(-1)
+    xg = x.float().view(-1, N // block_size, block_size)
+    amax = xg.abs().amax(dim=-1).clamp(min=1e-4)
+    scale = amax / 448.0
+    if scale_fmt is not None:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    y = (xg / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return (
+        y.view(*x.shape),
+        scale.view(*x.shape[:-1], N // block_size).contiguous(),
+    )
+
+
 # Not bit-exact with per_token_group_quant (1e-4 vs 1e-10 amax floor, x / scale vs
 # x * (448 / amax)), so it is not merged into that op.
 def act_quant(
@@ -104,6 +121,9 @@ def act_quant(
     assert x.size(-1) % block_size == 0, (
         f"Last dimension size must be divisible by block_size (block_size={block_size})"
     )
+    # ponytail: triton cannot lower fp8e4nv casts on SM80; aten fallback.
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9:
+        return _act_quant_aten(x, block_size, scale_fmt)
 
     # Flatten all dims except last
     N = x.size(-1)

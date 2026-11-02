@@ -75,7 +75,8 @@ class DeepseekSparseAttnBackendKPoolMixin:
             return "trtllm"
         if self.device_sm_major == 9:
             return "fa3"
-        return dsa_impl
+        # SM80: FlashMLA/FA3 are Hopper+; tilelang sparse MLA runs on sm80.
+        return "tilelang"
 
     def _kpool_index_page_size(self) -> int:
         return self.token_to_kv_pool.index_page_size
@@ -83,6 +84,9 @@ class DeepseekSparseAttnBackendKPoolMixin:
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
         if self.device_sm_major == 9:
             return self.num_q_heads in (32, 64)
+        if self.device_sm_major < 9:
+            # DeepGEMM has no SM80 kernels (metadata builder included).
+            return False
         return True
 
     def _init_kpool_metadata(

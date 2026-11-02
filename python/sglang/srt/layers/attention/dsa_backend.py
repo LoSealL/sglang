@@ -1293,9 +1293,9 @@ class DeepseekSparseAttnBackend(
                         )
                     ]
                 )
-                assert page_table_1_flattened.shape[0] == sum(indexer_seq_lens_cpu), (
-                    f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
-                )
+                assert page_table_1_flattened.shape[0] == sum(
+                    indexer_seq_lens_cpu
+                ), f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
@@ -2214,9 +2214,9 @@ class DeepseekSparseAttnBackend(
         if self.use_mha:
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
-            assert layer.tp_k_head_num == layer.tp_q_head_num > 1, (
-                "MHA_ONE_SHOT requires dense multi-head config"
-            )
+            assert (
+                layer.tp_k_head_num == layer.tp_q_head_num > 1
+            ), "MHA_ONE_SHOT requires dense multi-head config"
             return self._forward_standard_mha(
                 q=q,
                 k=k,
@@ -3479,9 +3479,9 @@ class DeepseekSparseAttnBackend(
         TOPK = page_table_1.shape[1]
         D_ckv = kv_cache.shape[-1]
         GATHER_PAGE_SIZE = 16
-        assert TOPK % GATHER_PAGE_SIZE == 0, (
-            f"TOPK {TOPK} must be a multiple of GATHER_PAGE_SIZE {GATHER_PAGE_SIZE}"
-        )
+        assert (
+            TOPK % GATHER_PAGE_SIZE == 0
+        ), f"TOPK {TOPK} must be a multiple of GATHER_PAGE_SIZE {GATHER_PAGE_SIZE}"
         NUM_PAGES = TOPK // GATHER_PAGE_SIZE
 
         # Count valid tokens per batch (non -1 entries)
@@ -3809,9 +3809,9 @@ class DeepseekSparseAttnBackend(
 
             # Save KV cache if requested
         if save_kv_cache:
-            assert k is not None and k_rope is not None, (
-                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            )
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             cache_loc = (
                 forward_batch.out_cache_loc
                 if not layer.is_cross_attention

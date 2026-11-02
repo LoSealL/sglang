@@ -355,6 +355,15 @@ def _use_torch_mqa_logits() -> bool:
     return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
 
 
+def _is_sm80() -> bool:
+    # A100 (SM80) has no FP8 tensor cores and no DeepGEMM kernels; DSA logits
+    # and the paged-MQA schedule fall back to bf16 / a no-op schedule.
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] < 9
+    )
+
+
 @lru_cache(maxsize=1)
 def resolve_num_sms() -> int:
     """SM count used to size the paged-MQA-logits schedule.
@@ -364,7 +373,7 @@ def resolve_num_sms() -> int:
     Both consumers only use it to shape the schedule metadata buffer, so the
     raw device SM count is an acceptable stand-in.
     """
-    if not _use_torch_mqa_logits():
+    if not _use_torch_mqa_logits() and not _is_sm80():
         import deep_gemm
 
         return deep_gemm.get_num_sms()
@@ -373,12 +382,19 @@ def resolve_num_sms() -> int:
     ).multi_processor_count
 
 
+def _noop_paged_mqa_logits_metadata(*args, **kwargs):
+    return None
+
+
 @lru_cache(maxsize=1)
 def resolve_paged_mqa_logits_metadata_fn():
     if _use_torch_mqa_logits():
         from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
 
         return get_paged_mqa_logits_metadata
+    if _is_sm80():
+        # The schedule builder is DeepGEMM-only; the SM80 fallbacks ignore it.
+        return _noop_paged_mqa_logits_metadata
     import deep_gemm
 
     return deep_gemm.get_paged_mqa_logits_metadata
@@ -457,6 +473,12 @@ def _fp8_paged_mqa_logits_torch(
 def resolve_fp8_paged_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_paged_mqa_logits_torch
+    if _is_sm80():
+        from sglang.kernels.ops.attention.dsa.sm80_mqa_logits import (
+            sm80_fp8_paged_mqa_logits,
+        )
+
+        return sm80_fp8_paged_mqa_logits
     import deep_gemm
 
     return deep_gemm.fp8_paged_mqa_logits
@@ -499,6 +521,12 @@ def _fp8_mqa_logits_torch(
 def resolve_fp8_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_mqa_logits_torch
+    if _is_sm80():
+        from sglang.kernels.ops.attention.dsa.sm80_mqa_logits import (
+            sm80_fp8_mqa_logits,
+        )
+
+        return sm80_fp8_mqa_logits
     import deep_gemm
 
     return deep_gemm.fp8_mqa_logits

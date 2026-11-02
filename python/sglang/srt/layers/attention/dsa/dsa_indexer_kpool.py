@@ -181,9 +181,9 @@ class IndexerKPool(MultiPlatformOp):
             f"index_topk ({self.index_topk}) must be divisible by "
             f"index_kpool ({self.index_kpool})"
         )
-        assert 64 % self.index_kpool == 0, (
-            f"index_kpool ({self.index_kpool}) must divide page_size (64)"
-        )
+        assert (
+            64 % self.index_kpool == 0
+        ), f"index_kpool ({self.index_kpool}) must divide page_size (64)"
 
         # resolve() pins ROCm to AITER and lets --dsa-paged-mqa-logits-backend reach this path
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
@@ -962,6 +962,15 @@ class IndexerKPool(MultiPlatformOp):
                 )
             return logits
 
+        # ponytail: SM80 bf16 fallback; see sm80_mqa_logits docstring
+        if is_cuda() and not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            from sglang.kernels.ops.attention.dsa.sm80_mqa_logits import (
+                sm80_fp8_mqa_logits,
+            )
+
+            return sm80_fp8_mqa_logits(
+                q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits
+            )
         return deep_gemm.fp8_mqa_logits(
             q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
         )
@@ -1020,8 +1029,16 @@ class IndexerKPool(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         use_aiter_paged_mqa = self.paged_mqa_logits_backend.is_aiter()
+        # ponytail: SM80 has no DeepGEMM/TileLang-FP8 kernels; bf16 cuBLAS
+        # fallback (sm80_mqa_logits). Remove when a native SM80 path exists.
+        use_sm80_fallback = (
+            is_cuda()
+            and not use_aiter_paged_mqa
+            and not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        )
         use_tilelang_paged_mqa = (
             not use_aiter_paged_mqa
+            and not use_sm80_fallback
             and self._should_use_tilelang_paged_mqa_logits(q_fp8)
         )
 
@@ -1036,7 +1053,9 @@ class IndexerKPool(MultiPlatformOp):
             block_tables=block_tables,
             seqlens_32=seqlens_32,
             blocksize=blocksize,
-            build_schedule_metadata=not (use_aiter_paged_mqa or use_tilelang_paged_mqa),
+            build_schedule_metadata=not (
+                use_aiter_paged_mqa or use_tilelang_paged_mqa or use_sm80_fallback
+            ),
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
         if use_aiter_paged_mqa:
@@ -1059,6 +1078,21 @@ class IndexerKPool(MultiPlatformOp):
                 pool_max_seq_len,
                 preshuffle=True,
                 kv_block_size=block_kv,
+            )
+        elif use_sm80_fallback:
+            from sglang.kernels.ops.attention.dsa.sm80_mqa_logits import (
+                sm80_fp8_paged_mqa_logits,
+            )
+
+            logits = sm80_fp8_paged_mqa_logits(
+                q_fp8.unsqueeze(1),
+                kv_cache_fp8,
+                weights,
+                pool_context_lens,
+                pool_block_tables,
+                pool_schedule_metadata,
+                pool_max_seq_len,
+                clean_logits=False,
             )
         elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
@@ -1201,9 +1235,9 @@ class IndexerKPool(MultiPlatformOp):
         total_k_rows = plan.ragged_total_k_rows
 
         n_real = seq_lens_expanded.shape[0]
-        assert n_real <= total_q, (
-            f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
-        )
+        assert (
+            n_real <= total_q
+        ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
 
         kv_fp8 = None
         if total_k_rows > 0:

@@ -249,9 +249,9 @@ def _per_token_group_quant_8bit_raw(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot be divisible by `group_size`"
-    )
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if _is_hip:
@@ -467,9 +467,9 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    assert eps == 1e-10, (
-        f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
-    )
+    assert (
+        eps == 1e-10
+    ), f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
     expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
     assert (fp8_min, fp8_max) == expected_range, (
         f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
@@ -499,9 +499,9 @@ def sglang_per_token_group_quant_fp8(
     output_q: Optional[torch.Tensor] = None,
     output_s: Optional[torch.Tensor] = None,
 ):
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot be divisible by `group_size`"
-    )
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     if (
@@ -577,9 +577,9 @@ def sglang_per_token_group_quant_fp8_row_padded(
     bit-exact; the caller still slices the GEMM output back to m.
     """
     assert x.dim() == 2, "row-padded quant expects a 2D input"
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` must be divisible by `group_size`"
-    )
+    assert (
+        x.shape[-1] % group_size == 0
+    ), "the last dimension of `x` must be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     supported_group_sizes = (
@@ -1059,9 +1059,9 @@ if _is_hip:
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
-            assert scale.numel() == 1, (
-                f"Expected scalar scale, got numel={scale.numel()}"
-            )
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
             else:
@@ -1097,9 +1097,9 @@ else:
                 )  # False for dynamic
         else:
             # Static scaling
-            assert scale.numel() == 1, (
-                f"Expected scalar scale, got numel={scale.numel()}"
-            )
+            assert (
+                scale.numel() == 1
+            ), f"Expected scalar scale, got numel={scale.numel()}"
             sgl_per_tensor_quant_fp8(
                 input, output, scale, is_static=True
             )  # True for static
