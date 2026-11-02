@@ -14,6 +14,16 @@ LOG_MAX_BYTES=$((100 * 1024 * 1024)) # truncate the log at 100MB
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 export HF_HOME=/nvme2data
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# This box ships sglang-kernel 0.4.6.post1 while the tree asks for 0.4.9. The
+# check compares version strings only, and the SM80 path uses none of the newer
+# symbols -- the same skip the DSV4.1 recipe in this repo relies on.
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+# ~/.cache/sglang/inductor holds root-owned graph dirs from an earlier root run,
+# so any graph hashing into one of them dies with PermissionError during CUDA
+# graph capture. Keep inductor in a writable dir; the triton/tilelang caches
+# stay where they are because the env var is applied with setdefault.
+export TORCHINDUCTOR_CACHE_DIR="$HOME/.cache/inductor-glm"
+mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
 PY="$REPO/.venv/bin/python"
 
 truncate_watchdog() {
